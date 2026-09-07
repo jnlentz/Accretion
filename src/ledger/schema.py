@@ -103,6 +103,13 @@ CREATE TABLE IF NOT EXISTS events (
     metadata_json TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_events_timestamp_level ON events(timestamp, level);
+
+-- 8. Trade Engine State (Zero-Loss Recovery & Persistence on Restart)
+CREATE TABLE IF NOT EXISTS engine_state (
+    symbol TEXT PRIMARY KEY,
+    state_json TEXT NOT NULL,
+    updated_at INTEGER NOT NULL
+);
 """
 
 def init_ledger_schema(conn) -> None:

@@ -1,6 +1,7 @@
 """
 Accretion Live Runtime Entrypoint (v1)
-Dry-run live bookkeeping, market data ingestion, and account reconciliation runner.
+Autonomous live structural wave trading engine, market data ingestion,
+zero-market-order monitored execution, and account reconciliation runner.
 """
 import os
 import sys
@@ -17,10 +18,13 @@ from src.utils.logger import setup_logger
 from src.adapters.binance_client import BinanceSpotAdapter
 from src.ledger.database import SQLiteLedger
 from src.ledger.reconciliation import ReconciliationEngine
+from src.strategy.trade_engine import TradeEngine
+from src.runtime.order_manager import OrderExecutionManager
 from src.runtime.market_poller import MarketPoller
 from src.runtime.account_poller import AccountPoller
 from src.runtime.command_processor import CommandProcessor
 from src.runtime.loop_runner import LoopRunner
+
 
 def main():
     # 1. Setup Structured Logging
@@ -34,8 +38,10 @@ def main():
     os.makedirs(state_dir, exist_ok=True)
     ledger_db_path = os.path.join(state_dir, 'accretion_ledger.sqlite')
     
-    # Active symbol list for v1
-    target_symbols = ['BTCUSDT']
+    # Active symbol and timeframe
+    primary_symbol = 'BTCUSDT'
+    target_symbols = [primary_symbol]
+    strategy_timeframe = '1h'
     exchange_name = 'binance_us'
     tld = 'us'
 
@@ -51,7 +57,26 @@ def main():
         tld=tld
     )
 
-    # 5. Initialize Reconciliation & Runtime Engines
+    # 5. Initialize Structural Strategy Engine
+    trade_engine = TradeEngine(
+        initial_target=0.12,        # 12% initial leg target
+        purple_discount=0.02,       # 2% discount below close for resting purple bid
+        floor_target=0.005,         # 0.5% harvest floor
+        day_hours=24,               # 24h trailing daily container
+        week_hours=168,             # 168h trailing weekly container
+        micro_floor_hours=6         # 6h trailing micro-floor
+    )
+
+    # 6. Initialize Order Execution Manager (Zero-Market-Order Engine)
+    order_manager = OrderExecutionManager(
+        adapter=adapter,
+        ledger=ledger,
+        default_quote_allocation_usd=100.0,  # Configurable sizing
+        default_timeout_sec=20.0,            # 20s chase window
+        default_max_drift_pct=0.005          # 0.5% drift ceiling
+    )
+
+    # 7. Initialize Poller & Reconciliation Engines
     reconciliation_engine = ReconciliationEngine(
         adapter=adapter,
         ledger=ledger,
@@ -61,7 +86,7 @@ def main():
     market_poller = MarketPoller(
         symbols=target_symbols,
         exchange=exchange_name,
-        timeframes=['3m'],
+        timeframes=[strategy_timeframe],
         adapter=adapter
     )
 
@@ -74,19 +99,24 @@ def main():
         adapter=adapter
     )
 
-    # 6. Initialize Dual-Interval Loop Runner
+    # 8. Initialize Runtime Loop Runner
     runner = LoopRunner(
         market_poller=market_poller,
         account_poller=account_poller,
         command_processor=command_processor,
         ledger=ledger,
-        market_interval_sec=180,  # 3 minutes for market bar closes
-        account_interval_sec=60,  # 1 minute for account reconciliation
-        command_interval_sec=5    # 5 seconds for external command checks
+        order_manager=order_manager,
+        trade_engine=trade_engine,
+        target_symbol=primary_symbol,
+        strategy_timeframe=strategy_timeframe,
+        market_interval_sec=60,   # Check for 1h candle closes every 60s
+        account_interval_sec=60,  # Account reconciliation every 60s
+        command_interval_sec=5    # Command processing & active order chasing every 5s
     )
 
-    # 7. Start Engine
+    # 9. Start Engine
     runner.start()
+
 
 if __name__ == '__main__':
     main()

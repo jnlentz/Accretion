@@ -1,87 +1,100 @@
-# Accretion — Context & Rules
+# Project Accretion: Context & Rules
 
 ## Project Overview
 
-Accretion is a live inventory trading bot. It is **not** the research lab.
+Accretion is the **live** execution environment. Singularity is research. Do not mix them.
 
-- Research (MarketMapper, SDI, structural levels, strategy experiments) lives in Singularity / related research folders.
-- Accretion is the deployed runtime: poll market data, keep exchange account state honest, persist every action, and (later) execute the lot-based DCA + limit-sell policy.
+This bot describes present market state from hierarchical rolling ranges and acts on that state. It does not forecast price. It does not use RSI, MACD, or other off-the-shelf indicators.
 
-**Current phase (v1):** data + account + ledger + order primitives.  
-Do **not** add MarketMapper, TradeEngine, strategy logic, contribution schedules, or a UI.
+**Current job:** Build and harden the live system around `TradeEngine` — ingest completed candles, maintain wave state, emit order actions, persist everything, route to the exchange.
 
 ---
 
-## Current Scope (strict)
+## Hard Rules (Strict Adherence Required)
 
-**In scope now**
-- Poll market data on the bar interval (3m for BTC first).
-- Poll account state on a faster interval (~1m): balances, open orders, fills.
-- Reconcile exchange state with a local SQLite ledger.
-- Order methods: place, cancel, query status (already exist — review, do not rewrite blindly).
-- Multi-symbol ready: do not hardcode a single coin into core types. Config already owns exchange/symbol lists.
-- Logging and crash-safe persistence.
+### 1. Visualization & Plotting
+* **Dark Mode Only:** `plt.style.use('dark_background')`.
+* **Display Method:** `plt.show()` by default. Never `savefig()` unless explicitly requested.
 
-**Out of scope now**
-- MarketMapper, SDI, parent/child levels, RPI.
-- Buy-phase / no-buy / lot-queue strategy.
-- Contribution schedule ($X/day etc.).
-- Dash or any other UI.
-- Android / remote control (later consumers of the same SQLite DB).
+### 2. Code Execution & Git
+* **Write-Only Mode:** The AI writes code and answers questions. It does not execute locally, install packages, or touch git history.
+* Stick to the requested file and scope.
 
-When research is ready, mapper + policy will be added as separate layers. Do not anticipate them in v1 code.
+### 3. Workflow Constraints
+* **Comment-Driven Development:** Follow instructions in code comments exactly.
+* **No Hallucinated Features:** Do not import libraries or add logic that was not asked for.
+* **Causal data only:** Rolling windows must exclude the forming bar. No look-ahead.
+* **Descriptive, not predictive:** Features and logs answer “what object are we inside?” — not “what happens next?”
 
----
-
-## Hard Rules
-
-### 1. Architecture
-- Replace any leftover Dash / old-strategy runner. Do not extend them.
-- Keep layers separate:
-  1. Exchange adapter
-  2. Ledger (SQLite is source of truth locally)
-  3. Runtime loops (market poll vs account poll)
-  4. Policy (does not exist yet — do not invent it)
-- Account loop is bookkeeping only. No trading decisions on the 1m poll.
-- Market loop runs on bar close. No strategy in v1 beyond “store the bar.”
-
-### 2. Persistence
-- SQLite for everything that must survive a restart.
-- Record: bars (or references), balances, order placements, cancels, fills, rejects, reconciliation mismatches.
-- The bot is the only writer. Future UIs only read (and later submit commands).
-
-### 3. Code discipline
-- Follow comments and the user’s explicit request. Do not expand scope.
-- Do not invent features, indicators, or strategy rules.
-- Prefer reviewing and wiring existing order methods over rewriting them.
-- Multi-asset: symbol-specific state lives behind a per-symbol book/config, not scattered `if symbol == 'BTC'` checks.
-
-### 4. Visualization
-- No Dash. If a debug plot is requested, dark mode + `plt.show()` only, and only when asked.
-
-### 5. Execution
-- Write-only advisor unless the user explicitly asks to run something.
-- Do not touch git history or install packages unless asked.
+### 4. Live-system constraints
+* Do not put Pandas in the hot path. TradeEngine uses Python + NumPy (circular buffers).
+* Do not place orders from inside feature math. Engine emits `TradeAction`; an adapter talks to the exchange.
+* Do not silently reset state on restart. Persist and restore.
+* Do not add MarketMapper / Singularity research scripts into this repo unless asked.
 
 ---
 
 ## Technical Context
 
-- Language: Python
-- Exchange: already configured (BinanceUS / symbols in existing config)
-- First live symbol: BTC pair from config
-- Intervals: market ~3m, account ~1m
-- DB: SQLite
-- Limit orders are the intended live order type later (maker / low or zero fee on BinanceUS). v1 only needs the methods in place.
+* **Language:** Python
+* **Live stack:** NumPy in the engine; SQLite for ledger/state; exchange adapter (Binance.US first; multi-symbol ready)
+* **Research stack (if plotting/sim):** pandas, matplotlib dark mode
+* **Clocks:** market bars on the strategy timeframe (1h); account/order reconciliation more often (e.g. 1m)
+* **Orders:** prefer maker/limit where the policy says limit; map actions 1:1 to exchange calls
+* **Quote:** BTC/USD preferred on Binance.US unless told otherwise (cleaner tax lots than USDT)
 
 ---
 
-## Design Intent (do not implement yet — remember it)
+## Strategy (implement only what is asked)
 
-Later Accretion will run a long-biased lot inventory system:
-- Split free cash into lots, buy on a schedule with min wait
-- Place a limit sell above each lot’s cost (never sell at a loss)
-- Recycle fill proceeds into remaining queued lots
-- Use research features (structure / levels / RPI) as no-buy and “especially low” gates
+Native bar: **1h**. Rolling windows exclude the current bar.
 
-v1 exists so that pipeline has a reliable live backbone before any of that is attached.
+**Containers**
+* Daily: trailing 24h high/low
+* Weekly: trailing 168h high/low
+* Micro-floor: trailing 6h high/low (immediate invalidation aid)
+
+**Macro states**
+* `ACTIVE_BULL` — daily pushing new weekly high
+* `BULL_EXHAUSTED` — 24h floor broken; up-wave stalled
+* `ACTIVE_BEAR` — daily pushing new weekly low
+* `BEAR_EXHAUSTED` — 24h ceiling broken; down-wave stalled
+
+**Micro states:** same pattern of push/stall of 1h vs 24h.
+
+**Intended action shape (do not invent extra modes)**
+* Resting limit bid in `BEAR_EXHAUSTED` after a micro bottom sequence; cancel and market-buy if macro goes `ACTIVE_BULL` unfilled
+* Market buy on direct macro transition to `ACTIVE_BULL`
+* Conditional reload in `BULL_EXHAUSTED` only when micro prints bear-exhaustion bounce
+* Harvest: decaying/halving profit targets on reloads in the same wave, down to a floor
+* Structural stop: hold through bull-exhausted pullbacks; flatten if macro becomes `ACTIVE_BEAR`
+* Never buy `ACTIVE_BEAR`. Default no-buy in `BULL_EXHAUSTED` except the explicit reload rule.
+
+If a prompt conflicts with this shape, follow the prompt and do not silently “improve” the policy.
+
+---
+
+## TradeEngine
+
+Self-contained event-driven class.
+
+* `on_candle(ohlcv)` — called on **closed** 1h bars only
+* Updates buffers → evaluates state → checks fills / policy → returns `TradeAction`s
+* Action types stay explicit: `PLACE_RESTING_LIMIT_BUY`, `CANCEL_RESTING_LIMIT_BUY`, `EXECUTE_MARKET_BUY`, `EXECUTE_MARKET_SELL` (extend only when asked)
+* Startup: warm with 168 closed 1h candles before any live action
+* Persist engine dict + open orders + fills to SQLite (or JSON if that is what the repo already uses)
+
+---
+
+## Persistence & Safety
+
+* Bot is the only writer of the ledger
+* Record: every action intent, exchange ack, fill, cancel, balance snapshot, state snapshot
+* Idempotent order placement (no duplicate live orders after restart)
+* Fail closed: if state/buffers are incomplete, do not trade
+
+---
+
+## Design Intent (background)
+
+Accretion vs Singularity stay separate. Research proved the range-push / physical-invalidation objects. Live code must reproduce those objects causally, then execute inventory policy against them. Complexity belongs in state + policy, not in extra indicators.

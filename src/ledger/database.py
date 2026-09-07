@@ -404,3 +404,43 @@ class SQLiteLedger:
                 json.dumps(metadata) if metadata else None
             ))
             conn.commit()
+
+    # ==========================================
+    # Engine State Persistence
+    # ==========================================
+
+    def save_engine_state(self, symbol: str, state_dict: Dict[str, Any]) -> None:
+        """
+        Persists serialized TradeEngine state for a symbol.
+        Enables lossless restart without requiring re-warming or state reset.
+        """
+        now = int(time.time())
+        state_str = json.dumps(state_dict)
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("""
+                INSERT INTO engine_state (symbol, state_json, updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(symbol) DO UPDATE SET
+                    state_json = excluded.state_json,
+                    updated_at = excluded.updated_at
+            """, (symbol.upper(), state_str, now))
+            conn.commit()
+
+    def load_engine_state(self, symbol: str) -> Optional[Dict[str, Any]]:
+        """
+        Loads the most recently persisted TradeEngine state for a symbol.
+        Returns None if no saved state exists.
+        """
+        with self._get_connection() as conn:
+            cursor = conn.cursor()
+            cursor.execute("SELECT state_json FROM engine_state WHERE symbol = ?", (symbol.upper(),))
+            row = cursor.fetchone()
+            if row and row['state_json']:
+                try:
+                    return json.loads(row['state_json'])
+                except Exception as e:
+                    logger.error(f"Failed to parse persisted engine state for {symbol}: {e}")
+                    return None
+            return None
+
