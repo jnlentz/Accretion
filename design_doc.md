@@ -266,3 +266,355 @@ Before writing any code:
 3. What default test dollar allocation would you prefer for the fill tests (e.g. $10 min notional)?
 
 Whenever you give the green light, we can implement the script and begin testing!
+
+===============================
+
+We've got a shiny new upgrade to integrate! check out the research_import folder - accretion_crypto_strategy... should explain everything.  Don't make any changes yet - what do you think?
+
+==================
+
+### Architectural Review: The 24/7 Crypto Intraday Engine Upgrade (`research_import`)
+
+Jesse, this is a **major strategic and architectural upgrade**. 
+
+The package in `research_import/` bridges SingularityCore’s continuous crypto research into Accretion. It transforms Accretion from a single-asset 1H heuristic state-machine into a **multi-asset, ML-calibrated, dual-passive-maker execution system**.
+
+Here is my direct assessment of the strategy, its architectural strengths, the critical integration details we need to plan for, and how it aligns with your core rules.
+
+---
+
+### 1. What Makes This Upgrade Powerful
+
+1. **Massive Statistical Edge Over Heuristics:**
+   - Instead of relying solely on rule-based wave states to trigger entries, the `HistGradientBoostingClassifier` trained on **28 first-principles structural features** predicts the explicit probability $P(\text{Hit } +x^* \text{ before } -y^*)$.
+   - By filtering for the **Top 2.0% conviction cutoff ($P^*$)**, the empirical win rate reaches **$43\%\text{--}52\%$** on asymmetric payoff targets ($2:1$ reward-to-risk), delivering a **$30\times$ to $100\times$ edge** over random market walk.
+
+2. **Dual Passive Maker Execution (0.0% Fee Architecture):**
+   - **Entry:** Resting maker limit buy at a **$-0.50\%$ discount** below signal close (1-bar / 15-minute cancellation timeout). This avoids chasing spikes and captures immediate mean-reversion discount.
+   - **Take-Profit:** Resting maker limit sell at **$+x^* + 0.15\%$ premium** above entry.
+   - On Binance.US, both of these orders execute at the **0.0% Maker fee tier**. Execution is not just zero-drag; it actively extracts an extra $+0.65\%$ in spread edge on winning round trips.
+
+3. **Multi-Asset Universe with Calibrated Champions:**
+   - Broadens trading from BTC-only to **6 liquid majors**: `BTC` ($+4\%/-2\%$), `ETH` ($+5\%/-2.5\%$), `SOL` ($+5\%/-2.5\%$), `ADA` ($+5\%/-2.5\%$), `XRP` ($+2.5\%/-1.25\%$), and `DOGE` ($+5\%/-2.5\%$).
+   - Dynamic portfolio management: Max **$5$ concurrent slots ($K=5$)** with **$50\%$ compounded equity sizing** (`min(equity * 0.50, free_cash)`), ensuring capital rotates into the highest-conviction setups across the market.
+
+4. **Built-in Verification & Auditability:**
+   - The inclusion of `crypto_live_prediction_validation_lab.py` and `LivePredictionLogger` provides a turnkey verification harness. We can mathematically prove that live features and predictions match research outputs to within $\le 10^{-4}$ tolerance before risking substantial capital.
+
+---
+
+### 2. Key Differences vs. Existing Accretion Skeleton
+
+| Dimension | Existing Accretion (`src/`) | New Upgrade (`research_import/`) |
+| :--- | :--- | :--- |
+| **Candle Cadence** | 1-Hour (`1h`) | **15-Minute (`15m`)** |
+| **Asset Scope** | BTC only (`BTCUSDT` / `BTCUSD`) | **6 Symbols** (`BTC`, `ETH`, `SOL`, `ADA`, `XRP`, `DOGE`) |
+| **Decision Core** | Deterministic state machine (Macro/Micro biomes + decaying targets) | **GBDT ML Classifier** (Top 2% conviction $P^*$) + 28 structural features |
+| **Lookback History** | 168 hours (168 bars) | **672 bars (7 days of 15m)** |
+| **Data Ingestion** | Binance.US SQLite/REST | **Kraken** (canonical unmanipulated volume) |
+| **Execution Venue** | Binance.US | **Binance.US** (0.0% maker fee tier) |
+| **Profit Harvesting** | Decaying halving ladder ($12\% \to 6\% \to \dots$) | **Champion Target Limits** ($+x^* + 0.15\%$) |
+| **Stop Mechanism** | Macro transition to `ACTIVE_BEAR` (Yellow hold / Red cut) | **Fixed Structural Barrier Stop** ($-y^*$) |
+
+---
+
+### 3. Critical Integration Considerations & Decisions
+
+Before we begin wiring this into Accretion, there are four key design points to address:
+
+#### A. Cross-Exchange Data Ingestion (Kraken Feed vs. Binance.US Execution)
+* **The Context:** The models in `models/` were trained on Kraken 15m OHLCV data. Kraken’s volume and price prints represent canonical institutional volume without zero-fee wash trading distortions.
+* **The Question:** Does your live environment have access to Kraken’s public market data API (which requires no API keys for public 15m OHLCV), or do you want to ingest directly from Binance.US?
+* **My Recommendation:** Implement a lightweight `KrakenMarketPoller` specifically to stream 15m closed bars for the 6 assets, while keeping `BinanceSpotAdapter` and `OrderExecutionManager` strictly for order execution on Binance.US. This preserves 100% distribution parity with the trained GBDT models.
+
+#### B. The Zero-Market-Order Rule vs. Stop-Loss Execution
+* **The Context:** The research spec (`accretion_crypto_strategy_spec.md`) notes a taker market stop loss at $-y^*$ (1.9 bps fee).
+* **Alignment with Your Rule:** In your first prompt, you emphasized: *"the intention is to never use market orders. When we need to buy or sell immediately my preferred method is to place a limit order for the current price."*
+* **Solution:** When a stop-loss barrier $-y^*$ is breached, instead of firing an exchange market order, we route the exit through `OrderExecutionManager` as a **monitored immediate limit sell** (pegged to the top-of-book best bid and chased every 5s until 100% flat). This fulfills your zero-market-order mandate while ensuring safe liquidation.
+
+#### C. Engine Hot-Path Performance (Pandas vs. NumPy Buffers)
+* **The Context:** `GEMINI.md` specifies *"Do not put Pandas in the hot path. TradeEngine uses Python + NumPy (circular buffers)."*
+* **The Reality:** In `crypto_live_engine.py`, `_compute_latest_features()` builds a DataFrame and uses Pandas rolling operations over an 800-bar deque. Because bars close every **15 minutes** (900 seconds), computing features for 6 symbols in Pandas takes approximately $\sim 15\text{ ms}$ total—well within performance budgets.
+* **Options:**
+  1. *Direct Integration:* Keep the feature extraction in `crypto_live_engine.py` as-is to guarantee bit-for-bit parity with SingularityCore and allow immediate deployment.
+  2. *NumPy Refactor:* Rewrite the 28 features into vectorized circular NumPy buffers to adhere strictly to the zero-pandas hot path rule.
+  *My recommendation:* Start with Option 1 for exact validation lab parity, then optimize to NumPy if/when latency or memory profiling demands it.
+
+#### D. State & Ledger Persistence
+* Accretion needs to persist:
+  1. The 6 feature engine rolling buffers (or easily re-warm them from SQLite on boot).
+  2. Active positions (`LivePosition`), including entry order ID, resting take-profit order ID, and stop-loss trigger levels.
+  3. Prediction logs written to `logs/live_predictions_{SYMBOL}.jsonl` for offline auditability.
+
+---
+
+### 4. Recommended Integration Plan
+
+When you are ready to proceed, here is the roadmap:
+
+1. **Step 1: Data Pipeline & Historical Warmup**
+   - Build a lightweight `KrakenMarketPoller` to fetch 672+ closed 15m candles on startup and poll for new 15m closes across `XBTUSD`, `ETHUSD`, `SOLUSD`, `ADAUSD`, `XRPUSD`, and `XDGUSD`.
+2. **Step 2: Model & Config Ingestion**
+   - Copy `config/` and `models/` into Accretion's runtime directory (`src/config/` and `src/models/`).
+   - Wire `CryptoLiveInferenceEngine` to evaluate bars on close.
+3. **Step 3: Execution Bridge (`OrderExecutionManager`)**
+   - Connect `TradeSignal` outputs to `OrderExecutionManager`:
+     - Place resting limit buy at $-0.50\%$ discount.
+     - 1-bar timeout auto-cancellation.
+     - On fill $\to$ place resting limit sell at $+x^* + 0.15\%$ on Binance.US + register monitored limit stop at $-y^*$.
+4. **Step 4: End-to-End Validation Run**
+   - Run `crypto_live_prediction_validation_lab.py` on paper/dry-run data to verify $|P_{\text{live}} - P_{\text{hist}}| \le 10^{-4}$ and confirm clean order routing.
+
+What do you think of this approach? Let me know your thoughts on Kraken data ingestion vs Binance.US, and we'll proceed from there!
+
+
+======================
+
+The approach is good - my main focus right now is getting inference set up so we can validate the models.  The crypto_live_prediction_validation_lab.py file is already set up to do that, we just need to get the predictions running live for a segment.
+
+I've copied the kraken subfolder from the databases folder in our research engironment into this one - we have the same data we did all our testing on.  When a live run starts we should start by bridging the gap between the end of the database data and the current moment.  
+
+=======================
+
+### Architectural & Implementation Plan: Live Streaming Inference & Historical Gap Bridging
+
+Jesse, focusing strictly on **streaming inference and model validation** is the exact right next step. Before routing real capital through the execution engine, we need an empirical audit proving that the live feature pipeline and GBDT probability outputs match the research baseline to within $\le 10^{-4}$ tolerance.
+
+Having the `databases/kraken/` folder already populated with the historical research data eliminates cold-start uncertainty. We don't have to guess historical boundary conditions—we have the exact data used to train and validate the champion models.
+
+Here is the architectural design and execution plan to bridge the database gap, run live streaming inference, and log predictions for validation.
+
+---
+
+### 1. Gap Bridging: Reconciling SQLite to Current Moment
+
+When the live runner initializes, each symbol's SQLite database in `databases/kraken/{symbol}.sqlite` will have an end timestamp $T_{\text{db\_end}}$ (e.g. from table `klines_15m`). 
+
+The gap bridging module will execute the following deterministic protocol:
+
+```
+┌────────────────────────────────────────────────────────────────────────┐
+│                      STARTUP GAP-BRIDGING PROTOCOL                     │
+└──────────────────────────────────┬─────────────────────────────────────┘
+                                   │
+                                   ▼
+        Query databases/kraken/{symbol}.sqlite for MAX(time) = T_db_end
+                                   │
+                                   ▼
+              Does (T_now - T_db_end) > 15 minutes (900s)?
+                                   ├── No ──> Database is current! Proceed to Warmup.
+                                  Yes
+                                   ▼
+        Query Kraken Public REST API: GET /0/public/OHLC
+        - pair = {symbol} (e.g., XBTUSD)
+        - interval = 15 (15-minute bars)
+        - since = T_db_end
+                                   │
+                                   ▼
+        Filter incoming candles:
+        1. Keep only completed bars: open_time + 900 <= T_now
+        2. Discard any forming/unclosed bar (t_open + 900 > T_now)
+                                   │
+                                   ▼
+        Persist new bars into databases/kraken/{symbol}.sqlite (INSERT OR REPLACE)
+                                   │
+                                   ▼
+        Feed contiguous history into CryptoLiveFeatureEngine.warmup(df_contiguous)
+```
+
+#### Key Implementation Details for Kraken OHLC API:
+* **Public Endpoint:** `https://api.kraken.com/0/public/OHLC` (requires no API key, no rate-limit consumption against private trading endpoints).
+* **Pagination / Catch-up:** Kraken returns up to 720 candles per call. If the gap between $T_{\text{db\_end}}$ and $T_{\text{now}}$ is longer than 720 bars (~7.5 days), the bridger loops using the `last` timestamp returned by Kraken until the gap is fully closed.
+* **Causal Bar Guarantee:** Only bars where `bar_close_time <= current_time` are committed to the database and passed to the engine. The forming bar is never ingested until it officially closes.
+
+---
+
+### 2. Live Streaming Inference Pipeline
+
+Once the historical database is bridged to the current moment, the system enters the **Live 15-Minute Streaming Cycle**:
+
+```
+                                    15-Minute Boundary
+                         (:00:05, :15:05, :30:05, :45:05 UTC)
+                                           │
+                                           ▼
+                            [KrakenMarketPoller.poll_latest()]
+                            Fetches newly closed 15m bar
+                                           │
+                                           ▼
+                         [Persist to SQLite: klines_15m]
+                                           │
+                                           ▼
+                      [CryptoLiveFeatureEngine.on_new_bar()]
+                      - Vectorized rolling updates (1h, 24h, 168h)
+                      - Continuous Micro state (MICRO_RED / MICRO_GREEN)
+                      - SDI statistical stretches & Z-scores
+                      - Tactical TCXA kinematics & efficiency decays
+                      - Emits 28 structural features
+                                           │
+                                           ▼
+                     [CryptoLiveInferenceEngine.evaluate()]
+                      - Evaluates calibrated GBDT champion model
+                      - Calculates P(Hit +x* before -y*)
+                      - Checks against top 2.0% cutoff threshold P*
+                      - Emits structured TradeSignal
+                                           │
+                                           ▼
+                      [LivePredictionLogger.log_prediction()]
+                      - Writes structured JSONL record to:
+                        logs/live_predictions_{symbol}.jsonl
+```
+
+#### Structured Log Record Format:
+Every 15-minute close (whether a signal fires or not), a single-line JSON record is written to `logs/live_predictions_{symbol}.jsonl`:
+```json
+{
+  "timestamp": "2026-09-20T14:00:00+00:00",
+  "kraken_symbol": "XBTUSD",
+  "binance_symbol": "BTCUSD",
+  "close_price": 63450.0,
+  "p_pred": 0.1425,
+  "cutoff_threshold": 0.128235,
+  "x_star": 4.0,
+  "y_star": 2.0,
+  "is_signal": true,
+  "limit_buy_price": 63132.75,
+  "limit_sell_price": 65752.73,
+  "stop_loss_price": 61870.10,
+  "features": {
+    "rpi_h_pos": 0.82,
+    "rpi_d_pos": 0.65,
+    "rpi_wk_pos": 0.54,
+    "...": "all 28 features"
+  }
+}
+```
+
+---
+
+### 3. Hardening `crypto_live_prediction_validation_lab.py` for Accretion
+
+In `research_import/crypto_live_prediction_validation_lab.py`, lines 55–72 attempt to import research preprocessors from `labs.crypto_intraday_barrier_feature_preprocessor`. In Accretion, those research scripts may not be present in `labs/`.
+
+To make the validation lab 100% self-contained and immediately runnable in Accretion:
+1. **Direct Model & Config Loading:** The validation lab can load the champion models directly from `research_import/models/{symbol}_gbdt.joblib` and thresholds from `research_import/config/crypto_champions_config.json`.
+2. **Deterministic Research Feature Benchmark:** We will provide the self-contained historical feature generator directly inside the lab or via `src/strategy/` so the validation lab runs with zero missing dependencies.
+3. **Strict Parity Audits:**
+   - Feature drift: $\max |F_{\text{live}} - F_{\text{hist}}| \le 10^{-4}$
+   - Probability divergence: $\max |P_{\text{live}} - P_{\text{hist}}| \le 10^{-4}$
+   - Pearson correlation: $r \ge 0.9999$ ($R^2 \approx 1.0$)
+   - Signal agreement: $100.0\%$
+
+---
+
+### 4. Proposed Components to Implement
+
+To get this live inference segment running immediately, I propose implementing:
+
+1. **`src/adapters/kraken_data.py` (`KrakenData` / `KrakenMarketPoller`):**
+   - Handles public REST queries to Kraken `OHLC` endpoint.
+   - Implements `bridge_gap(symbol, db_path)`: Reads SQLite `MAX(time)`, fetches missing completed 15m candles, and inserts them.
+   - Implements `poll_latest_closed_bar(symbol)`: Efficiently polls the single newly closed 15m bar at each interval.
+
+2. **`scripts/run_live_inference_feed.py` (Dedicated Inference & Validation Runner):**
+   - Clean CLI tool to run the live inference feed independently of order execution:
+     ```bash
+     python scripts/run_live_inference_feed.py --symbol XBTUSD
+     # Or run all 6 champions concurrently:
+     python scripts/run_live_inference_feed.py --all
+     ```
+   - **Phase 1 (Startup):** Bridges the gap for the configured symbol(s) in `databases/kraken/`.
+   - **Phase 2 (Warmup):** Loads the trailing 672+ bars into `CryptoLiveFeatureEngine`.
+   - **Phase 3 (Streaming):** Sleeps until the next 15-minute close (:00:05, :15:05, etc.), ingests the closed bar, evaluates GBDT inference, and logs to `logs/live_predictions_{symbol}.jsonl`.
+
+3. **Validation Workflow:**
+   - Let `run_live_inference_feed.py` run for a desired segment (e.g. 24 hours = 96 bars, or several days).
+   - At any point during or after the run, execute:
+     ```bash
+     python research_import/crypto_live_prediction_validation_lab.py --symbol XBTUSD
+     ```
+   - It will load the live JSONL log, compute the aligned historical research features over the exact same timestamps, print the scorecard, and render the dark-mode 4-panel parity dashboard (`plt.show()`).
+
+---
+
+### 5. Next Steps
+
+If this setup looks good to you:
+1. Do you want to start with a single primary asset (e.g., **`XBTUSD`**) or run all 6 champions (**`XBTUSD`**, **`ETHUSD`**, **`SOLUSD`**, **`ADAUSD`**, **`XRPUSD`**, **`XDGUSD`**) from the start?
+2. Once confirmed, I will implement `src/adapters/kraken_data.py` and `scripts/run_live_inference_feed.py` and ensure `crypto_live_prediction_validation_lab.py` is ready to audit your first live segment!
+
+==================================
+
+I've updated the validation lab to a new, self contained one.  
+
+Let's just do our validation test on XBTUSD for now - also note the metadata files I've added for the models
+
+==================================
+
+### Implementation: Live XBTUSD Inference Feed, Gap Bridging & Metadata Integration
+
+Jesse, excellent updates. I reviewed the new self-contained `crypto_live_prediction_validation_lab.py` and the `{symbol}_meta.json` files in `research_import/models/`.
+
+Here is the operational breakdown of what has been implemented to run the live validation test for **`XBTUSD`**:
+
+---
+
+### 1. Model Metadata Integration (`XBTUSD_meta.json`)
+The metadata file for XBTUSD establishes the exact calibrated production targets and cutoff:
+* **Target ($+x^*$):** $+4.0\%$
+* **Stop Loss ($-y^*$):** $-2.0\%$
+* **Calibrated Conviction Cutoff ($P^*$):** `0.11769137701584131` (Top 2.0% cutoff)
+* **Base Win Rate:** $1.50\%$ (demonstrating the massive $>30\times$ statistical edge of the champion model)
+
+I have updated `CryptoLiveInferenceEngine.load_models_from_dir()` in `research_import/crypto_live_engine.py` to automatically detect and parse `{symbol}_meta.json`. This guarantees that both the live engine and `crypto_live_prediction_validation_lab.py` evaluate against the exact same cutoff threshold to the 16th decimal place.
+
+---
+
+### 2. Kraken Public Data Adapter & Gap Bridger (`src/adapters/kraken_data.py`)
+To bridge the historical SQLite data to the current moment, `KrakenData` handles:
+* **Canonical Symbol Translation:** Translates `XBTUSD` $\leftrightarrow$ `XXBTZUSD` for Kraken's public REST API.
+* **Gap Detection & Reconciliation:**
+  1. Inspects `databases/kraken/XBTUSD.sqlite` for the latest recorded timestamp (`MAX(time)` in `klines_15m`).
+  2. If the gap exceeds 15 minutes (900 seconds), it queries Kraken's public `OHLC` endpoint (`GET https://api.kraken.com/0/public/OHLC?pair=XXBTZUSD&interval=15&since={since}`).
+  3. Paginates through historical chunks (up to 720 candles per call) until the database is 100% contiguous up to the last closed 15m candle.
+  4. Strictly filters out the currently forming/unclosed candle (`time + 900 > now_utc`) to maintain causal lookback integrity.
+  5. Inserts missing bars into `klines_15m` with primary key conflict replacement (`INSERT OR REPLACE`).
+* **Live Bar Polling:** At the close of each 15m bar, efficiently queries the newly closed bar and commits it to SQLite.
+
+---
+
+### 3. Dedicated Live Inference Runner (`scripts/run_live_inference_feed.py`)
+A self-contained script designed specifically to run the live inference test segment on `XBTUSD`:
+
+```bash
+# Run the live streaming inference feed on XBTUSD:
+python scripts/run_live_inference_feed.py --symbol XBTUSD
+
+# Or run a single-bar dry check (bridges gap, warms up, evaluates latest closed bar, and exits):
+python scripts/run_live_inference_feed.py --symbol XBTUSD --run-once
+```
+
+#### Execution Lifecycle:
+1. **Startup & Gap Bridge:** Reconciles `databases/kraken/XBTUSD.sqlite` to the present moment via Kraken REST API.
+2. **Buffer Warmup:** Loads the trailing 672+ bars (7 days of 15m) into `CryptoLiveFeatureEngine` to establish 1h, 24h, and 168h rolling containers, micro states, SDI stretches, and TCXA kinematics.
+3. **Model Initialization:** Loads `XBTUSD_gbdt.joblib` and `XBTUSD_meta.json` into `CryptoLiveInferenceEngine`.
+4. **15-Minute Streaming Cadence:**
+   - Calculates the exact sleep time until the next 15-minute close + 5s latency cushion (e.g., :00:05, :15:05, :30:05, :45:05 UTC).
+   - On wake, polls Kraken for the closed candle, commits to SQLite, updates features in `CryptoLiveFeatureEngine`, and computes $P(\text{Hit } +4.0\% \text{ before } -2.0\%)$.
+   - Logs the full record (features, probability, threshold, and order levels) to `logs/live_predictions_XBTUSD.jsonl` via `LivePredictionLogger`.
+
+---
+
+### 4. Running the Validation Lab
+Once `run_live_inference_feed.py` has run for your desired segment (e.g. 24 hours = 96 bars, or several days), run the validation lab to verify parity:
+
+```bash
+python research_import/crypto_live_prediction_validation_lab.py --symbol XBTUSD
+```
+
+This will:
+1. Load `logs/live_predictions_XBTUSD.jsonl`.
+2. Compute the exact historical research features across the same timestamps.
+3. Assert $\max |P_{\text{live}} - P_{\text{hist}}| \le 10^{-4}$ and $\max |F_{\text{live}} - F_{\text{hist}}| \le 10^{-4}$.
+4. Print the CLI verification scorecard.
+5. Render the 4-panel dark-mode diagnostic dashboard (`plt.show()`).

@@ -1,0 +1,101 @@
+{
+  "_comment": "SingularityCore Production Champion Configurations for Accretion Live Deployment",
+  "generated_date": "2026-09-19 22:16:52.121661+00:00",
+  "exchange_execution": "BINANCE_US",
+  "exchange_data_feed": "KRAKEN",
+  "parameters": {
+    "discount_pct": 0.5,
+    "sell_premium_pct": 0.15,
+    "max_concurrent_slots": 5,
+    "position_size_fraction": 0.5,
+    "order_timeout_bars": 1,
+    "maker_fee_bps": 0.0,
+    "taker_fee_bps": 1.9
+  },
+  "champions": {
+    "XBTUSD": {
+      "x_star": 4.0,
+      "y_star": 2.0,
+      "cutoff_pct": 2.0,
+      "cutoff_threshold": 0.128235,
+      "binance_sym": "BTCUSD",
+      "model_file": "XBTUSD_gbdt.joblib"
+    },
+    "ETHUSD": {
+      "x_star": 5.0,
+      "y_star": 2.5,
+      "cutoff_pct": 2.0,
+      "cutoff_threshold": 0.043264,
+      "binance_sym": "ETHUSD",
+      "model_file": "ETHUSD_gbdt.joblib"
+    },
+    "SOLUSD": {
+      "x_star": 5.0,
+      "y_star": 2.5,
+      "cutoff_pct": 2.0,
+      "cutoff_threshold": 0.136364,
+      "binance_sym": "SOLUSD",
+      "model_file": "SOLUSD_gbdt.joblib"
+    },
+    "ADAUSD": {
+      "x_star": 5.0,
+      "y_star": 2.5,
+      "cutoff_pct": 2.0,
+      "cutoff_threshold": 0.13901,
+      "binance_sym": "ADAUSD",
+      "model_file": "ADAUSD_gbdt.joblib"
+    },
+    "XRPUSD": {
+      "x_star": 2.5,
+      "y_star": 1.25,
+      "cutoff_pct": 2.0,
+      "cutoff_threshold": 0.288473,
+      "binance_sym": "XRPUSD",
+      "model_file": "XRPUSD_gbdt.joblib"
+    },
+    "XDGUSD": {
+      "x_star": 5.0,
+      "y_star": 2.5,
+      "cutoff_pct": 2.0,
+      "cutoff_threshold": 0.229361,
+      "binance_sym": "DOGEUSD",
+      "model_file": "XDGUSD_gbdt.joblib"
+    }
+  },
+  "features": [
+    "rpi_h_pos",
+    "rpi_d_pos",
+    "rpi_wk_pos",
+    "rpi_compression_h_in_d",
+    "rpi_compression_d_in_wk",
+    "sdi_h_stretch",
+    "sdi_h_zscore",
+    "sdi_d_stretch",
+    "sdi_d_zscore",
+    "sdi_wk_stretch",
+    "sdi_wk_zscore",
+    "bar_body_ratio",
+    "bar_thrust_dir",
+    "bar_rvol",
+    "ret_24h_pct",
+    "is_green",
+    "is_yellow",
+    "is_red",
+    "is_purple",
+    "tactical_state_duration_bars",
+    "is_micro_green",
+    "dist_to_shelf_floor_pct",
+    "tcxa_h_phase",
+    "tcxa_h_time_since_x",
+    "tcxa_h_c_to_t_pct",
+    "tcxa_h_c_age_bars",
+    "tcxa_h_c_velocity",
+    "tcxa_h_efficiency_decay",
+    "tcxa_d_phase",
+    "tcxa_d_time_since_x",
+    "tcxa_d_c_to_t_pct",
+    "tcxa_d_c_age_bars",
+    "tcxa_d_c_velocity",
+    "tcxa_d_efficiency_decay"
+  ]
+}
