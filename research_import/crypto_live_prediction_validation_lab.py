@@ -95,11 +95,19 @@ _apply_sklearn_compatibility_shims()
 
 # Add current directory and project root to sys.path
 SCRIPT_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SCRIPT_DIR.parent.parent if SCRIPT_DIR.name in ("accretion", "research_import") else SCRIPT_DIR
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
+if SCRIPT_DIR.name == "research_import":
+    PROJECT_ROOT = SCRIPT_DIR.parent
+elif SCRIPT_DIR.name == "accretion":
+    PROJECT_ROOT = SCRIPT_DIR
+elif (SCRIPT_DIR / "databases").exists() or (SCRIPT_DIR / "src").exists():
+    PROJECT_ROOT = SCRIPT_DIR
+else:
+    PROJECT_ROOT = SCRIPT_DIR.parent
+
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+if str(SCRIPT_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPT_DIR))
 
 # Import self-contained live engine classes
 try:
@@ -113,7 +121,7 @@ try:
         WARMUP_BARS_MIN
     )
 except ImportError:
-    from core.crypto_live_engine import (
+    from research_import.crypto_live_engine import (
         CryptoLiveFeatureEngine,
         CryptoLiveInferenceEngine,
         TradeSignal,
@@ -127,7 +135,7 @@ except ImportError:
 # ⚙️ CONSTANTS & VALIDATION CONFIGURATION
 # ==============================================================================
 DEFAULT_SYMBOL = "XBTUSD"
-DEFAULT_LOG_DIR = SCRIPT_DIR / "logs" if (SCRIPT_DIR / "logs").exists() else PROJECT_ROOT / "logs"
+DEFAULT_LOG_DIR = PROJECT_ROOT / "logs" if (PROJECT_ROOT / "logs").exists() else SCRIPT_DIR / "logs"
 FEATURE_DRIFT_TOLERANCE = 1e-4      # Max acceptable absolute feature drift
 PROBABILITY_TOLERANCE   = 1e-4      # Max acceptable probability divergence
 CORRELATION_THRESHOLD   = 0.9999    # Min acceptable Pearson r
@@ -173,14 +181,12 @@ def resolve_crypto_db(ticker: str, custom_path: Optional[str] = None) -> Path:
     canonical = kraken_alias_map.get(clean, clean)
 
     candidates = [
+        PROJECT_ROOT / "databases" / "kraken" / f"{canonical}.sqlite",
+        SCRIPT_DIR.parent / "databases" / "kraken" / f"{canonical}.sqlite",
+        PROJECT_ROOT / "databases" / f"{canonical}.sqlite",
         SCRIPT_DIR / "databases" / "kraken" / f"{canonical}.sqlite",
         SCRIPT_DIR / "data" / "kraken" / f"{canonical}.sqlite",
-        SCRIPT_DIR / "data" / f"{canonical}.sqlite",
         SCRIPT_DIR / f"{canonical}.sqlite",
-        PROJECT_ROOT / "databases" / "kraken" / f"{canonical}.sqlite",
-        PROJECT_ROOT / "data" / "kraken" / f"{canonical}.sqlite",
-        PROJECT_ROOT / "data" / f"{canonical}.sqlite",
-        PROJECT_ROOT / "databases" / f"{canonical}.sqlite",
     ]
 
     for p in candidates:
@@ -814,8 +820,11 @@ def plot_dark_mode_validation_dashboard(summary: Dict[str, Any], symbol: str) ->
     # Panel 2: Scatter Correlation (Asserting R^2 = 1.0)
     ax2 = axes[0, 1]
     ax2.scatter(df_h['p_pred_hist'], df_l['p_pred'], color='#00e676', alpha=0.6, s=25, label='Inference Points')
-    p_min = min(df_h['p_pred_hist'].min(), df_l['p_pred'].min())
-    p_max = max(df_h['p_pred_hist'].max(), df_l['p_pred'].max())
+    p_min = float(min(df_h['p_pred_hist'].min(), df_l['p_pred'].min()))
+    p_max = float(max(df_h['p_pred_hist'].max(), df_l['p_pred'].max()))
+    if abs(p_max - p_min) < 1e-6:
+        p_min -= 0.01
+        p_max += 0.01
     ax2.plot([p_min, p_max], [p_min, p_max], color='#ff1744', ls='--', lw=1.5, label='Perfect Parity (y = x)')
     ax2.set_title(f"Panel 2: Probability Parity Correlation (R^2 = {summary['p_corr']**2:.6f})", color='white', fontsize=11)
     ax2.set_xlabel("Historical Research P", color='white')
@@ -825,7 +834,7 @@ def plot_dark_mode_validation_dashboard(summary: Dict[str, Any], symbol: str) ->
 
     # Panel 3: Maximum Absolute Error across Features
     ax3 = axes[1, 0]
-    ax3.barh(feat_df['feature'], feat_df['max_err'], color='#7c4dff', alpha=0.85)
+    bars = ax3.barh(feat_df['feature'], feat_df['max_err'], color='#7c4dff', alpha=0.85)
     ax3.axvline(FEATURE_DRIFT_TOLERANCE, color='#ff1744', ls='--', lw=1.2, label=f'Tolerance ({FEATURE_DRIFT_TOLERANCE})')
     ax3.set_xscale('log')
     ax3.set_title("Panel 3: Maximum Feature Absolute Error (Log Scale)", color='white', fontsize=11)
@@ -879,9 +888,23 @@ def main():
     elif args.log_file:
         log_path = Path(args.log_file)
     else:
-        log_path = DEFAULT_LOG_DIR / f"live_predictions_{symbol}.jsonl"
-        if not log_path.exists():
-            print(f"ℹ️ No live log found at {log_path}. Running with --mock-demo to demonstrate verification...")
+        # Search all possible project locations for live predictions JSONL
+        possible_log_paths = [
+            PROJECT_ROOT / "logs" / f"live_predictions_{symbol}.jsonl",
+            DEFAULT_LOG_DIR / f"live_predictions_{symbol}.jsonl",
+            SCRIPT_DIR / "logs" / f"live_predictions_{symbol}.jsonl",
+            Path.cwd() / "logs" / f"live_predictions_{symbol}.jsonl",
+            Path.cwd() / f"live_predictions_{symbol}.jsonl",
+        ]
+        log_path = None
+        for p in possible_log_paths:
+            if p.exists() and p.stat().st_size > 0:
+                log_path = p
+                break
+
+        if log_path is None:
+            fallback = PROJECT_ROOT / "logs" / f"live_predictions_{symbol}.jsonl"
+            print(f"ℹ️ No live log found at {fallback}. Running with --mock-demo to demonstrate verification...")
             log_path = generate_mock_live_segment(symbol, segment_bars=args.segment_bars, db_path=db_path)
 
     # 1. Load live log

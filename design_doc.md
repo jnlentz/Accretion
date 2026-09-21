@@ -725,4 +725,47 @@ python scripts/run_live_inference_feed.py --symbol XBTUSD --run-once
 And start the live feed:
 ```bash
 python scripts/run_live_inference_feed.py --symbol XBTUSD
-```
+```
+=================================
+
+We need to update the prediction validation lab to work within this project.  I've had live inference running for about an hour and am ready to check the predictions - they are saved wherever that script saves them.  Take a look at the prediction validator and make sure it's aligned with our current project layout
+
+=====================================
+
+### Alignment Complete: Prediction Validation Lab (`research_import/crypto_live_prediction_validation_lab.py`)
+
+Jesse, I thoroughly inspected `research_import/crypto_live_prediction_validation_lab.py` and aligned all paths and dependencies with Accretion's layout.
+
+---
+
+### Key Alignments & Fixes Made:
+
+1. **`PROJECT_ROOT` & Path Resolution:**
+   - **The Issue:** `PROJECT_ROOT` was previously defined as `SCRIPT_DIR.parent.parent`, which evaluated to `E:\Projects` rather than `E:\Projects\Accretion`. This broke path lookups for logs, databases, and models.
+   - **The Fix:** Updated path resolution so when the script is inside `research_import/`, `PROJECT_ROOT` correctly resolves to `SCRIPT_DIR.parent` (`E:\Projects\Accretion`).
+
+2. **Prediction Log Discovery (`logs/`):**
+   - Verified that `scripts/run_live_inference_feed.py` has been successfully writing live records to [`logs/live_predictions_XBTUSD.jsonl`](file:///E:/Projects/Accretion/logs/live_predictions_XBTUSD.jsonl).
+   - In `main()`, added automatic multi-path discovery so the lab automatically finds `logs/live_predictions_{symbol}.jsonl` without requiring `--log-file`.
+
+3. **Database Resolution (`resolve_crypto_db`):**
+   - Prioritized `PROJECT_ROOT / "databases" / "kraken" / "{canonical}.sqlite"` at the top of candidate paths so it immediately finds [`databases/kraken/XBTUSD.sqlite`](file:///E:/Projects/Accretion/databases/kraken/XBTUSD.sqlite).
+
+4. **Single/Short Segment Plot Safety:**
+   - Added a span margin guard in `plot_dark_mode_validation_dashboard()` so when auditing short initial test segments (e.g. 1–4 bars where $\min(P) \approx \max(P)$), matplotlib scales the axes properly without singular-bound warnings.
+
+---
+
+### How to Run the Validation Lab:
+
+You can now run the validator directly from your project root:
+
+```bash
+python research_import/crypto_live_prediction_validation_lab.py --symbol XBTUSD
+```
+
+This will:
+1. Load your live records from [`logs/live_predictions_XBTUSD.jsonl`](file:///E:/Projects/Accretion/logs/live_predictions_XBTUSD.jsonl).
+2. Query [`databases/kraken/XBTUSD.sqlite`](file:///E:/Projects/Accretion/databases/kraken/XBTUSD.sqlite) for the matching historical candles and compute the exact research feature benchmark.
+3. Compare live $P(\text{Hit})$ against historical $P(\text{Hit})$ and verify feature parity across all 34 features.
+4. Output the CLI scorecard and render the 4-panel dark-mode diagnostic dashboard (`plt.show()`).
