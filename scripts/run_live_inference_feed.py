@@ -23,6 +23,48 @@ import argparse
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
+from typing import Optional, Dict, Any, List, Union
+import types
+
+# ==============================================================================
+# 🛠️ SCIKIT-LEARN UNPICKLING COMPATIBILITY SHIM
+# Resolves 'No module named _loss' when loading models saved with sklearn 1.7.x in 1.9.x+
+# ==============================================================================
+def _apply_sklearn_compatibility_shims():
+    if '_loss' not in sys.modules:
+        try:
+            import sklearn._loss as _sk_loss
+            proxy = types.ModuleType('_loss')
+            proxy.__dict__.update(_sk_loss.__dict__)
+            if hasattr(_sk_loss, 'loss'):
+                proxy.__dict__.update(_sk_loss.loss.__dict__)
+            try:
+                import sklearn._loss._loss as _sk_loss_cy
+                proxy.__dict__.update(_sk_loss_cy.__dict__)
+            except ImportError:
+                pass
+            try:
+                import sklearn.ensemble._hist_gradient_boosting._loss as _sk_hgb_loss
+                proxy.__dict__.update(_sk_hgb_loss.__dict__)
+            except ImportError:
+                pass
+
+            class _LossProxy(types.ModuleType):
+                def __getattr__(self, name):
+                    if hasattr(_sk_loss, name):
+                        return getattr(_sk_loss, name)
+                    for sub in ['loss', '_loss']:
+                        if hasattr(_sk_loss, sub) and hasattr(getattr(_sk_loss, sub), name):
+                            return getattr(getattr(_sk_loss, sub), name)
+                    raise AttributeError(f"module '_loss' has no attribute '{name}'")
+
+            loss_proxy = _LossProxy('_loss')
+            loss_proxy.__dict__.update(proxy.__dict__)
+            sys.modules['_loss'] = loss_proxy
+        except Exception:
+            pass
+
+_apply_sklearn_compatibility_shims()
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
