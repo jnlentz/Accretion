@@ -7,7 +7,7 @@ import time
 import sqlite3
 import logging
 import pandas as pd
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Any, Union, Tuple
 from src.adapters.binance_client import BinanceSpotAdapter
 from src.adapters.BinanceData import BinanceData
 import config

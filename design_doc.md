@@ -1205,4 +1205,50 @@ python scripts/run_crypto_live_strategy.py --mode paper
 # 2. Live Execution Mode (Routes real maker orders to Binance.US via REST API):
 python scripts/run_crypto_live_strategy.py --mode live
 ```
-
+
+=======================
+
+## Bug report
+Traceback (most recent call last):
+  File "/home/singularity/dev/Accretion/scripts/run_crypto_live_strategy.py", line 54, in <module>
+    from src.runtime.outage_recovery import OutageRecoveryEngine
+  File "/home/singularity/dev/Accretion/src/runtime/__init__.py", line 1, in <module>
+    from src.runtime.market_poller import MarketPoller
+  File "/home/singularity/dev/Accretion/src/runtime/market_poller.py", line 17, in <module>
+    class MarketPoller:
+  File "/home/singularity/dev/Accretion/src/runtime/market_poller.py", line 131, in MarketPoller
+    def get_warmup_candles(self, symbol: str, timeframe: str = "1h", limit: int = 168) -> List[Dict[str, Any]]:
+                                                                                                         ^^^
+NameError: name 'Any' is not defined. Did you mean: 'any'?
+
+==========================
+
+### Fix Applied: Missing `Any` Import in `src/runtime/market_poller.py`
+
+Jesse, thank you for reporting that. When `scripts/run_crypto_live_strategy.py` imported `OutageRecoveryEngine` from `src.runtime.outage_recovery`, Python executed the package initializer `src/runtime/__init__.py`. This imported `MarketPoller`, which raised `NameError: name 'Any' is not defined` on line 131 because `Any` was omitted from its `typing` import.
+
+---
+
+### Root Cause & Changes Made:
+
+1. **Typing Import Fix ([`src/runtime/market_poller.py`](file:///E:/Projects/Accretion/src/runtime/market_poller.py#L10)):**
+   - Updated line 10 to include `Any`, `Union`, and `Tuple`:
+     ```python
+     from typing import List, Dict, Optional, Any, Union, Tuple
+     ```
+2. **Package Export Enhancement ([`src/runtime/__init__.py`](file:///E:/Projects/Accretion/src/runtime/__init__.py#L6-L16)):**
+   - Added `OutageRecoveryEngine` to `src/runtime/__init__.py` imports and `__all__` so it can also be imported directly from `src.runtime`.
+
+---
+
+### Ready to Run:
+
+You can now start the strategy runner in either mode:
+
+```bash
+# 1. Paper / Simulation Mode:
+python scripts/run_crypto_live_strategy.py --mode paper
+
+# 2. Live Execution Mode:
+python scripts/run_crypto_live_strategy.py --mode live
+```
