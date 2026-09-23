@@ -313,3 +313,144 @@ class BinanceSpotAdapter:
         except Exception as e:
             logger.error(f"Error fetching klines for {symbol} ({interval}): {e}")
             return []
+
+    def create_limit_buy(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        client_order_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Convenience method to place a BUY limit order."""
+        return self.place_limit_order(
+            symbol=symbol,
+            side=SIDE_BUY,
+            price=price,
+            quantity=quantity,
+            client_order_id=client_order_id
+        )
+
+    def create_limit_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        price: float,
+        client_order_id: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """Convenience method to place a SELL limit order."""
+        return self.place_limit_order(
+            symbol=symbol,
+            side=SIDE_SELL,
+            price=price,
+            quantity=quantity,
+            client_order_id=client_order_id
+        )
+
+    def get_best_bid_ask(self, symbol: str) -> Dict[str, float]:
+        """Returns top-of-book best bid and best ask prices."""
+        symbol = symbol.upper()
+        try:
+            book = self.client.get_order_book(symbol=symbol, limit=5)
+            best_bid = float(book['bids'][0][0]) if book.get('bids') else self.get_ticker_price(symbol)
+            best_ask = float(book['asks'][0][0]) if book.get('asks') else self.get_ticker_price(symbol)
+            return {'bid': best_bid, 'ask': best_ask}
+        except Exception as e:
+            logger.warning(f"Error fetching order book for {symbol}: {e}")
+            price = self.get_ticker_price(symbol)
+            return {'bid': price, 'ask': price}
+
+    def execute_monitored_limit_sell(
+        self,
+        symbol: str,
+        quantity: float,
+        timeout_seconds: float = 60.0,
+        chase_interval: float = 3.0
+    ) -> Dict[str, Any]:
+        """
+        Executes a zero-market-order monitored pegged limit sell.
+        Places a limit sell pegged to top-of-book best bid, monitors fills, and chases price
+        every chase_interval seconds until 100% liquidated.
+        """
+        symbol = symbol.upper()
+        remaining_qty = self.format_quantity(symbol, quantity)
+        total_qty = remaining_qty
+        cumulative_quote = 0.0
+        start_time = time.time()
+
+        filters = self.get_symbol_filters(symbol)
+        min_qty = filters.get('min_qty', 0.000001)
+
+        while remaining_qty >= min_qty and (time.time() - start_time) < timeout_seconds:
+            # 1. Fetch current top of book best bid
+            best_levels = self.get_best_bid_ask(symbol)
+            current_price = best_levels.get('bid', 0.0)
+            if current_price <= 0:
+                current_price = self.get_ticker_price(symbol)
+
+            if current_price <= 0:
+                time.sleep(chase_interval)
+                continue
+
+            formatted_price = self.format_price(symbol, current_price)
+            formatted_qty = self.format_quantity(symbol, remaining_qty)
+
+            if formatted_qty < min_qty:
+                break
+
+            # 2. Place limit sell pegged to best bid
+            order_id = None
+            try:
+                order = self.create_limit_sell(
+                    symbol=symbol,
+                    quantity=formatted_qty,
+                    price=formatted_price
+                )
+                order_id = order.get('orderId')
+            except Exception as e:
+                logger.error(f"Failed to place pegged limit sell for {symbol}: {e}")
+                time.sleep(chase_interval)
+                continue
+
+            # 3. Monitor order for fill
+            time.sleep(chase_interval)
+            try:
+                status_res = self.get_order_status(symbol=symbol, order_id=order_id)
+                if not status_res:
+                    continue
+
+                status = status_res.get('status')
+                executed_qty = float(status_res.get('executedQty', 0.0))
+                cummulative_quote_qty = float(status_res.get('cummulativeQuoteQty', 0.0))
+
+                if status == 'FILLED':
+                    remaining_qty -= executed_qty
+                    cumulative_quote += cummulative_quote_qty
+                    break
+                elif status in ('PARTIALLY_FILLED', 'NEW'):
+                    # Cancel remaining and re-peg at new best price
+                    try:
+                        self.cancel_order(symbol=symbol, order_id=order_id)
+                    except Exception:
+                        pass
+                    post_cancel = self.get_order_status(symbol=symbol, order_id=order_id)
+                    actual_executed = float(post_cancel.get('executedQty', executed_qty)) if post_cancel else executed_qty
+                    actual_quote = float(post_cancel.get('cummulativeQuoteQty', cummulative_quote_qty)) if post_cancel else cummulative_quote_qty
+
+                    remaining_qty = self.format_quantity(symbol, remaining_qty - actual_executed)
+                    cumulative_quote += actual_quote
+            except Exception as e:
+                logger.error(f"Error monitoring pegged limit sell for {symbol}: {e}")
+                time.sleep(chase_interval)
+
+        filled_qty = total_qty - remaining_qty
+        avg_price = (cumulative_quote / filled_qty) if filled_qty > 0 else current_price
+        return {
+            'symbol': symbol,
+            'total_qty': total_qty,
+            'executed_qty': filled_qty,
+            'remaining_qty': remaining_qty,
+            'avg_price': avg_price,
+            'cumulative_quote': cumulative_quote,
+            'is_fully_filled': remaining_qty < min_qty
+        }
+

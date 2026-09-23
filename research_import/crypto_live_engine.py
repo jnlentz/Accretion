@@ -494,7 +494,7 @@ class CryptoLiveInferenceEngine:
         self,
         models_dir: Optional[Union[str, Path]] = None,
         discount_pct: float = 0.50,
-        sell_premium_pct: float = 0.15
+        sell_premium_pct: float = 0.30
     ):
         self.models_dir = Path(models_dir) if models_dir else None
         self.discount_pct = discount_pct
@@ -632,10 +632,10 @@ class CryptoDualLimitExecutionEngine:
     def __init__(
         self,
         initial_capital: float = 10_000.0,
-        max_slots: int = 5,
+        max_slots: int = 2,
         position_size_fraction: float = 0.50,
         discount_pct: float = 0.50,
-        sell_premium_pct: float = 0.15,
+        sell_premium_pct: float = 0.30,
         order_timeout_bars: int = 1
     ):
         self.initial_capital = initial_capital

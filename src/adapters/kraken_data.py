@@ -331,3 +331,30 @@ class KrakenData:
             "close": float(latest_c[4]),
             "volume": float(latest_c[6]),
         }
+
+    def bridge_gap_all(self, symbols: List[str]) -> Dict[str, int]:
+        """Bridges gaps across multiple symbols sequentially."""
+        results = {}
+        for sym in symbols:
+            try:
+                inserted = self.bridge_gap(sym)
+                results[sym] = inserted
+            except Exception as e:
+                logger.error(f"Error bridging gap for {sym}: {e}")
+                results[sym] = 0
+            time.sleep(0.3)
+        return results
+
+    def poll_latest_closed_bars_all(self, symbols: List[str]) -> Dict[str, Optional[Dict[str, Any]]]:
+        """Polls the latest closed bar across all symbols."""
+        results = {}
+        for sym in symbols:
+            try:
+                bar = self.poll_latest_closed_bar(sym)
+                results[sym] = bar
+            except Exception as e:
+                logger.error(f"Error polling closed bar for {sym}: {e}")
+                results[sym] = None
+            time.sleep(0.1)
+        return results
+
