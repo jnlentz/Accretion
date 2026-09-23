@@ -186,7 +186,15 @@ class OutageRecoveryEngine:
                             'source': 'exchange'
                         })
             except Exception as e:
-                logger.error(f"Error querying open orders on Binance.US during outage audit: {e}")
+                err_str = str(e)
+                if "-2015" in err_str:
+                    logger.error(
+                        f"❌ [OUTAGE RECOVERY] Binance.US APIError(code=-2015): Invalid API-key, IP, or permissions.\n"
+                        f"   -> Please check Binance.US API Management: ensure 'Enable Reading' and 'Enable Spot Trading' are active,\n"
+                        f"   -> and if IP restrictions are enabled, add this machine's public IP address to the whitelist."
+                    )
+                else:
+                    logger.error(f"Error querying open orders on Binance.US during outage audit: {e}")
 
         # 2. Local State Audit (In-memory / SQLite resting orders)
         if self.portfolio.resting_orders:

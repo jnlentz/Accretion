@@ -111,7 +111,7 @@ class CryptoPortfolioEngine:
         discount_pct: float = 0.50,
         sell_premium_pct: float = 0.30,
         order_ttl_bars: int = 1,
-        min_notional_usd: float = 20.0
+        min_notional_usd: float = 10.0
     ):
         self.initial_capital = float(initial_capital)
         self.free_cash = float(initial_capital)
@@ -213,6 +213,10 @@ class CryptoPortfolioEngine:
             tot_equity = self.get_total_equity(current_prices)
             target_cap = tot_equity * self.position_size_fraction
             alloc_cap = min(target_cap, self.free_cash)
+
+            # Adaptive floor: if 50% sizing is below min_notional but free cash covers it, allocate min_notional
+            if alloc_cap < self.min_notional_usd and self.free_cash >= self.min_notional_usd:
+                alloc_cap = self.min_notional_usd
 
             if alloc_cap < self.min_notional_usd:
                 logger.warning(

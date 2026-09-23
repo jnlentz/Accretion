@@ -79,7 +79,7 @@ class CryptoLiveStrategyRunner:
     def __init__(
         self,
         mode: str = "paper",
-        initial_capital: float = 10_000.0,
+        initial_capital: Optional[float] = None,
         max_slots: int = 2,
         symbols: Optional[List[str]] = None,
         discount_pct: float = 0.50,
@@ -116,7 +116,20 @@ class CryptoLiveStrategyRunner:
                 logger.error(f"Failed to initialize BinanceSpotAdapter: {e}. Falling back to paper mode.")
                 self.mode = "paper"
 
-        # 2. Initialize Engines
+        # 2. Determine base trading capital (Detect real USD balance in live mode)
+        live_bal = None
+        if self.mode == "live" and self.binance_adapter:
+            live_bal = self._fetch_live_binance_balance()
+
+        if live_bal is not None and live_bal > 0.0:
+            actual_capital = live_bal
+            logger.info(f"💰 Setting base capital to live Binance.US balance: ${actual_capital:,.2f}")
+        elif initial_capital is not None:
+            actual_capital = float(initial_capital)
+        else:
+            actual_capital = 10_000.0 if self.mode == "paper" else 100.0
+
+        # 3. Initialize Engines
         self.feature_engines: Dict[str, CryptoLiveFeatureEngine] = {
             s: CryptoLiveFeatureEngine(s) for s in self.symbols
         }
@@ -130,29 +143,81 @@ class CryptoLiveStrategyRunner:
             self.inference_engine.load_models_from_dir(self.models_dir, config_path=self.config_path)
 
         self.portfolio = CryptoPortfolioEngine(
-            initial_capital=initial_capital,
+            initial_capital=actual_capital,
             max_slots=max_slots,
             position_size_fraction=0.50,
             discount_pct=discount_pct,
             sell_premium_pct=sell_premium_pct,
-            order_ttl_bars=order_ttl_bars
+            order_ttl_bars=order_ttl_bars,
+            min_notional_usd=10.0
         )
 
         # Restore state if previously persisted
         if self.portfolio.load_state(self.portfolio_db):
             logger.info("Successfully restored portfolio state from SQLite.")
+            # In live mode, reconcile free cash with the real live exchange balance
+            if live_bal is not None and live_bal > 0.0:
+                if not self.portfolio.active_positions and not self.portfolio.resting_orders:
+                    self.portfolio.initial_capital = live_bal
+                    self.portfolio.free_cash = live_bal
+                else:
+                    self.portfolio.free_cash = live_bal
+                logger.info(f"💰 Re-aligned portfolio cash with live Binance.US balance: ${live_bal:,.2f}")
         else:
-            logger.info(f"Initialized fresh portfolio state with ${initial_capital:,.2f} capital.")
+            logger.info(f"Initialized fresh portfolio state with ${actual_capital:,.2f} capital.")
 
         self.current_ticker_prices: Dict[str, float] = {}
 
+    def _fetch_live_binance_balance(self) -> Optional[float]:
+        """Queries Binance.US for available USD balance (fallback to USDT)."""
+        if not self.binance_adapter:
+            return None
+        try:
+            usd_bal = self.binance_adapter.get_asset_balance('USD')
+            free_usd = float(usd_bal.get('free', 0.0))
+            if free_usd > 0.0:
+                logger.info(f"💰 [BINANCE LIVE] Available USD balance: ${free_usd:,.2f}")
+                return free_usd
+
+            usdt_bal = self.binance_adapter.get_asset_balance('USDT')
+            free_usdt = float(usdt_bal.get('free', 0.0))
+            if free_usdt > 0.0:
+                logger.info(f"💰 [BINANCE LIVE] USD is $0.00, but detected available USDT: ${free_usdt:,.2f}")
+                return free_usdt
+
+            logger.warning("⚠️ [BINANCE LIVE] Both USD and USDT free balances are $0.00 on Binance.US.")
+            return 0.0
+        except Exception as e:
+            err_str = str(e)
+            if "-2015" in err_str:
+                logger.error(
+                    f"❌ [BINANCE LIVE] Binance.US APIError(code=-2015): Invalid API-key, IP, or permissions.\n"
+                    f"   -> Ensure your API key has 'Enable Reading' and 'Enable Spot Trading' checked on Binance.US.\n"
+                    f"   -> If IP restrictions are enabled, whitelist this machine's public IP on Binance.US."
+                )
+            else:
+                logger.error(f"❌ [BINANCE LIVE] Failed to query account balance: {e}")
+            return None
+
     def startup_and_warmup(self) -> None:
         """Runs outage recovery and warms up streaming feature buffers for all 6 coins."""
+        # Refresh live balance on startup in live mode
+        if self.mode == "live" and self.binance_adapter:
+            live_bal = self._fetch_live_binance_balance()
+            if live_bal is not None and live_bal > 0.0:
+                if not self.portfolio.active_positions and not self.portfolio.resting_orders:
+                    self.portfolio.initial_capital = live_bal
+                    self.portfolio.free_cash = live_bal
+                else:
+                    self.portfolio.free_cash = live_bal
+                self.portfolio.save_state(self.portfolio_db)
+
         print("\n" + "=" * 95)
         print(f"🚀 INITIALIZING 24/7 CRYPTO LIVE STRATEGY (MODE: {self.mode.upper()})")
         print("=" * 95)
         print(f"Universe ({len(self.symbols)} assets) : {', '.join(self.symbols)}")
         print(f"Prioritization Policy   : Policy 4 RVOL Volume Surge")
+        print(f"Base Trading Capital    : ${self.portfolio.initial_capital:,.2f} (Free Cash: ${self.portfolio.free_cash:,.2f})")
         print(f"Concurrency Slots (K)   : {self.portfolio.max_slots} Slots | 50% Compounded Equity Sizing")
         print(f"Execution Geometry      : Buy Discount -{self.portfolio.discount_pct:.2f}% | Sell Premium +{self.portfolio.sell_premium_pct:.2f}%")
         print(f"Order TTL               : {self.portfolio.order_ttl_bars} Bar(s) ({self.portfolio.order_ttl_bars * 15} min)")
@@ -571,7 +636,7 @@ class CryptoLiveStrategyRunner:
 def main():
     parser = argparse.ArgumentParser(description="24/7 Crypto Live Strategy Runner (Policy 4 RVOL)")
     parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live"], help="Execution mode (paper or live)")
-    parser.add_argument("--initial-capital", type=float, default=10_000.0, help="Initial portfolio capital ($ USD)")
+    parser.add_argument("--initial-capital", type=float, default=None, help="Initial portfolio capital ($ USD). In live mode, automatically fetches live USD balance from Binance.US if omitted.")
     parser.add_argument("--slots", type=int, default=2, help="Concurrency slots (default: 2)")
     parser.add_argument("--discount", type=float, default=0.50, help="Maker limit buy discount %% (default: 0.50)")
     parser.add_argument("--premium", type=float, default=0.30, help="Maker limit TP sell premium %% (default: 0.30)")
