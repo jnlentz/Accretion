@@ -201,15 +201,26 @@ class CryptoLiveStrategyRunner:
 
     def startup_and_warmup(self) -> None:
         """Runs outage recovery and warms up streaming feature buffers for all 6 coins."""
-        # Refresh live balance on startup in live mode
+        # Step 1: Run Outage Recovery & Self-Healing Protocol (Audits open orders and adopts unrecorded inventory)
+        recovery_engine = OutageRecoveryEngine(
+            portfolio=self.portfolio,
+            kraken_data=self.kraken_data,
+            activity_ledger=self.activity_ledger,
+            binance_adapter=self.binance_adapter,
+            mode=self.mode,
+            symbols=self.symbols,
+            portfolio_db=self.portfolio_db
+        )
+        recovery_engine.reconcile()
+
+        # Refresh live USD balance on startup in live mode
         if self.mode == "live" and self.binance_adapter:
             live_bal = self._fetch_live_binance_balance()
             if live_bal is not None and live_bal > 0.0:
-                if not self.portfolio.active_positions and not self.portfolio.resting_orders:
-                    self.portfolio.initial_capital = live_bal
-                    self.portfolio.free_cash = live_bal
-                else:
-                    self.portfolio.free_cash = live_bal
+                self.portfolio.free_cash = live_bal
+                # Base trading capital represents total portfolio equity (cash + open inventory)
+                tot_live_eq = self.portfolio.get_total_equity(self.current_ticker_prices)
+                self.portfolio.initial_capital = tot_live_eq
                 self.portfolio.save_state(self.portfolio_db)
 
         print("\n" + "=" * 95)
@@ -224,18 +235,6 @@ class CryptoLiveStrategyRunner:
         print(f"Zero-Market-Order Stop  : Monitored Pegged Limit Sell (-y*)")
         print(f"Activity Database       : {self.activity_ledger.db_path.name} (WAL Mode)")
         print("=" * 95 + "\n")
-
-        # Step 1: Run Outage Recovery & Self-Healing Protocol
-        recovery_engine = OutageRecoveryEngine(
-            portfolio=self.portfolio,
-            kraken_data=self.kraken_data,
-            activity_ledger=self.activity_ledger,
-            binance_adapter=self.binance_adapter,
-            mode=self.mode,
-            symbols=self.symbols,
-            portfolio_db=self.portfolio_db
-        )
-        recovery_engine.reconcile()
 
         # Step 2: Warm up streaming feature engines with 672 bars
         logger.info(f"Warming up streaming feature engines with {WARMUP_BARS_MIN} bars...")
@@ -332,9 +331,132 @@ class CryptoLiveStrategyRunner:
                     details={'dollar_pnl': tr['dollar_pnl'], 'net_ret_pct': tr['net_ret_pct']}
                 )
 
-        # 2. In Paper Mode, simulate order fills against current ticker prices
-        if self.mode == "paper":
+        # 2. Check Order Fills
+        if self.mode == "live":
+            self._poll_live_order_fills()
+        elif self.mode == "paper":
             self._simulate_paper_fills()
+
+    def _poll_live_order_fills(self) -> None:
+        """
+        Polls Binance.US for fills on resting buy orders and resting TP sell orders.
+        Transitions filled buy orders into active positions and pre-places TP limit sells.
+        Reconciles filled TP sells, logs completed trades, and frees capital & slots.
+        """
+        if self.mode != "live" or not self.binance_adapter:
+            return
+
+        # 1. Check Resting Buy Orders for Fills
+        for sym, order in list(self.portfolio.resting_orders.items()):
+            ex_id = order.exchange_order_id
+            bsym = order.binance_symbol
+            if not ex_id:
+                continue
+
+            try:
+                order_info = self.binance_adapter.get_order_status(bsym, order_id=ex_id)
+                if not order_info:
+                    continue
+
+                status = order_info.get('status', '').upper()
+                if status == 'FILLED':
+                    exec_qty = float(order_info.get('executedQty', order.quantity))
+                    quote_qty = float(order_info.get('cummulativeQuoteQty', 0.0))
+                    avg_price = quote_qty / exec_qty if exec_qty > 0 and quote_qty > 0 else float(order_info.get('price', order.limit_buy_price))
+
+                    logger.info(f"⚡ [BINANCE LIVE FILL] Limit Buy FILLED: {bsym} Qty: {exec_qty} @ ${avg_price:,.4f}")
+
+                    self.activity_ledger.log_order_event(
+                        event_type="BUY_FILLED",
+                        symbol=sym,
+                        binance_symbol=bsym,
+                        side="BUY",
+                        order_type="LIMIT",
+                        price=avg_price,
+                        quantity=exec_qty,
+                        allocated_capital=avg_price * exec_qty,
+                        order_id=order.order_id,
+                        exchange_order_id=ex_id,
+                        reason="Binance.US Limit Buy Filled",
+                        status="FILLED"
+                    )
+
+                    # Transitions resting order to ActivePosition and emits PLACE_RESTING_LIMIT_SELL
+                    actions = self.portfolio.on_buy_fill(sym, avg_price, exec_qty)
+                    for act in actions:
+                        self._execute_action(act)
+
+                    self.portfolio.save_state(self.portfolio_db)
+
+                elif status in ('CANCELED', 'REJECTED', 'EXPIRED'):
+                    logger.info(f"ℹ️ [BINANCE LIVE] Buy order {ex_id} for {bsym} was {status}. Removing from resting orders.")
+                    popped = self.portfolio.resting_orders.pop(sym, None)
+                    if popped:
+                        self.portfolio.free_cash += popped.allocated_capital
+                    self.portfolio.save_state(self.portfolio_db)
+
+            except Exception as e:
+                logger.warning(f"Error polling order status for {bsym} (id={ex_id}): {e}")
+
+        # 2. Check Active Positions for TP Limit Sell Fills
+        for sym, pos in list(self.portfolio.active_positions.items()):
+            ex_id = pos.tp_order_id
+            bsym = pos.binance_symbol
+
+            # If position does NOT have an open TP order on Binance, place it!
+            if not ex_id:
+                fmt_price = self.binance_adapter.format_price(bsym, pos.limit_sell_price)
+                fmt_qty = self.binance_adapter.format_quantity(bsym, pos.quantity)
+                try:
+                    res = self.binance_adapter.create_limit_sell(bsym, fmt_qty, fmt_price)
+                    pos.tp_order_id = str(res.get('orderId'))
+                    logger.info(f"⚡ [BINANCE LIVE] Placed missing TP Limit Sell for {bsym}: id={pos.tp_order_id}")
+                    self.portfolio.save_state(self.portfolio_db)
+                except Exception as e:
+                    logger.error(f"Failed to place TP sell for active position {bsym}: {e}")
+                continue
+
+            try:
+                order_info = self.binance_adapter.get_order_status(bsym, order_id=ex_id)
+                if not order_info:
+                    continue
+
+                status = order_info.get('status', '').upper()
+                if status == 'FILLED':
+                    exec_qty = float(order_info.get('executedQty', pos.quantity))
+                    quote_qty = float(order_info.get('cummulativeQuoteQty', 0.0))
+                    fill_price = quote_qty / exec_qty if exec_qty > 0 and quote_qty > 0 else float(order_info.get('price', pos.limit_sell_price))
+
+                    logger.info(f"🎉 [BINANCE LIVE TP FILL] Take-profit filled: {bsym} Qty: {exec_qty} @ ${fill_price:,.4f}")
+
+                    self.portfolio.on_tp_fill(sym, fill_price)
+                    if self.portfolio.closed_trades:
+                        tr = self.portfolio.closed_trades[-1]
+                        self.activity_ledger.log_completed_trade(tr)
+                        self.activity_ledger.log_order_event(
+                            event_type="TP_FILLED",
+                            symbol=sym,
+                            binance_symbol=bsym,
+                            side="SELL",
+                            order_type="LIMIT",
+                            price=fill_price,
+                            quantity=exec_qty,
+                            allocated_capital=tr['allocated_capital'],
+                            order_id=pos.position_id,
+                            exchange_order_id=ex_id,
+                            reason="Take-Profit Limit Filled on Exchange",
+                            status="FILLED",
+                            details={'dollar_pnl': tr['dollar_pnl'], 'net_ret_pct': tr['net_ret_pct']}
+                        )
+
+                    self.portfolio.save_state(self.portfolio_db)
+
+                elif status in ('CANCELED', 'REJECTED', 'EXPIRED'):
+                    logger.warning(f"⚠️ [BINANCE LIVE] TP order {ex_id} for {bsym} is {status}. Resetting tp_order_id to re-place.")
+                    pos.tp_order_id = None
+
+            except Exception as e:
+                logger.warning(f"Error polling TP order status for {bsym} (id={ex_id}): {e}")
 
     def _simulate_paper_fills(self) -> None:
         """Paper mode fill simulator against live top-of-book prices."""
@@ -473,6 +595,30 @@ class CryptoLiveStrategyRunner:
                     )
                 except Exception as e:
                     logger.error(f"Failed to place live limit buy on Binance.US: {e}")
+                    # Immediately rollback admitted order so slot is not trapped
+                    if action.symbol in self.portfolio.resting_orders:
+                        popped = self.portfolio.resting_orders.pop(action.symbol, None)
+                        if popped:
+                            self.portfolio.free_cash += popped.allocated_capital
+                    # If rejected due to insufficient balance, sync free cash with real Binance USD
+                    if "-2010" in str(e):
+                        live_bal = self._fetch_live_binance_balance()
+                        if live_bal is not None:
+                            self.portfolio.free_cash = live_bal
+                    self.portfolio.save_state(self.portfolio_db)
+                    self.activity_ledger.log_order_event(
+                        event_type="BUY_FAILED",
+                        symbol=sym,
+                        binance_symbol=bsym,
+                        side="BUY",
+                        order_type="LIMIT",
+                        price=fmt_price,
+                        quantity=fmt_qty,
+                        allocated_capital=alloc_cap,
+                        order_id=action.order_ref,
+                        reason=f"Binance order failed: {e}",
+                        status="REJECTED"
+                    )
             else:
                 logger.info(f"📝 [PAPER ROUTE] Resting Limit Buy {bsym} Qty: {action.quantity:.6f} @ ${action.price:,.2f}")
                 self.activity_ledger.log_order_event(
@@ -491,14 +637,28 @@ class CryptoLiveStrategyRunner:
 
         elif act_type == PortfolioActionType.CANCEL_RESTING_LIMIT_BUY:
             alloc_cap = action.price * action.quantity
-            ex_id = None
-            if sym in self.portfolio.resting_orders:
+            ex_id = action.exchange_order_id
+            if not ex_id and sym in self.portfolio.resting_orders:
                 ex_id = self.portfolio.resting_orders[sym].exchange_order_id
 
-            if self.mode == "live" and self.binance_adapter:
-                logger.info(f"⚡ [BINANCE LIVE] Cancelling Limit Buy {bsym}")
+            if self.mode == "live" and self.binance_adapter and ex_id:
                 try:
-                    if ex_id:
+                    # Check if order already filled right before cancellation
+                    st = self.binance_adapter.get_order_status(bsym, order_id=ex_id)
+                    if st and st.get('status') == 'FILLED':
+                        exec_qty = float(st.get('executedQty', action.quantity))
+                        quote_qty = float(st.get('cummulativeQuoteQty', 0.0))
+                        avg_p = quote_qty / exec_qty if exec_qty > 0 and quote_qty > 0 else float(st.get('price', action.price))
+                        logger.info(f"⚡ [BINANCE LIVE] Limit buy for {bsym} filled right before cancel! Reconciling as fill @ ${avg_p:,.4f}")
+                        # Re-deduct capital that was returned in on_bar_close
+                        self.portfolio.free_cash -= (avg_p * exec_qty)
+                        actions = self.portfolio.on_buy_fill(sym, avg_p, exec_qty)
+                        for a in actions:
+                            self._execute_action(a)
+                        self.portfolio.save_state(self.portfolio_db)
+                        return
+                    elif st and st.get('status') in ('NEW', 'PARTIALLY_FILLED'):
+                        logger.info(f"⚡ [BINANCE LIVE] Cancelling Limit Buy {bsym} (id={ex_id})")
                         self.binance_adapter.cancel_order(bsym, order_id=ex_id)
                 except Exception as e:
                     logger.error(f"Failed to cancel buy order {ex_id} on Binance.US: {e}")
@@ -531,6 +691,7 @@ class CryptoLiveStrategyRunner:
                     ex_id = str(res.get('orderId'))
                     if action.symbol in self.portfolio.active_positions:
                         self.portfolio.active_positions[action.symbol].tp_order_id = ex_id
+                    self.portfolio.save_state(self.portfolio_db)
                     self.activity_ledger.log_order_event(
                         event_type="TP_PREPLACED",
                         symbol=sym,
@@ -563,10 +724,33 @@ class CryptoLiveStrategyRunner:
                     status="SUBMITTED"
                 )
 
+        elif act_type == PortfolioActionType.CANCEL_RESTING_LIMIT_SELL:
+            ex_id = action.exchange_order_id
+            if not ex_id and sym in self.portfolio.active_positions:
+                ex_id = self.portfolio.active_positions[sym].tp_order_id
+            if self.mode == "live" and self.binance_adapter and ex_id:
+                logger.info(f"⚡ [BINANCE LIVE] Cancelling Resting TP Limit Sell {bsym} (id={ex_id})")
+                try:
+                    self.binance_adapter.cancel_order(bsym, order_id=ex_id)
+                except Exception as e:
+                    logger.error(f"Failed to cancel TP sell {ex_id} on Binance.US: {e}")
+            else:
+                logger.info(f"📝 [PAPER ROUTE] Cancelled Resting TP Limit Sell {bsym}")
+
         elif act_type == PortfolioActionType.SUBMIT_MONITORED_LIMIT_SELL:
             # Zero-Market-Order Stop Invalidation: Chased limit sell at best bid
             alloc_cap = action.price * action.quantity
             if self.mode == "live" and self.binance_adapter:
+                # Cancel resting TP order first if still open so inventory is unlocked
+                ex_id = action.exchange_order_id
+                if not ex_id and sym in self.portfolio.active_positions:
+                    ex_id = self.portfolio.active_positions[sym].tp_order_id
+                if ex_id:
+                    try:
+                        self.binance_adapter.cancel_order(bsym, order_id=ex_id)
+                    except Exception:
+                        pass
+
                 fmt_price = self.binance_adapter.format_price(bsym, action.price)
                 fmt_qty = self.binance_adapter.format_quantity(bsym, action.quantity)
                 logger.warning(f"🚨 [BINANCE LIVE] Zero-Market-Order Stop Liquidation {bsym} Qty: {fmt_qty} @ ${fmt_price:,.2f}")

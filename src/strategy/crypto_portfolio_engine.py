@@ -63,6 +63,7 @@ class PortfolioAction:
     target_price: Optional[float] = None
     stop_price: Optional[float] = None
     order_ref: Optional[str] = None
+    exchange_order_id: Optional[str] = None
 
 
 @dataclass
@@ -303,7 +304,8 @@ class CryptoPortfolioEngine:
                 price=order.limit_buy_price,
                 quantity=order.quantity,
                 reason=f"1-Bar TTL Expired ({self.order_ttl_bars * 15}m)",
-                order_ref=order.order_id
+                order_ref=order.order_id,
+                exchange_order_id=order.exchange_order_id
             ))
 
         # 2. Increment holding duration on active positions
@@ -472,7 +474,8 @@ class CryptoPortfolioEngine:
                 price=pos.limit_sell_price,
                 quantity=pos.quantity,
                 reason="Stop Loss Triggered",
-                order_ref=pos.position_id
+                order_ref=pos.position_id,
+                exchange_order_id=pos.tp_order_id
             ))
 
             # Step 2: Zero-Market-Order compliant chased limit liquidation
@@ -483,7 +486,8 @@ class CryptoPortfolioEngine:
                 price=cur_p,
                 quantity=pos.quantity,
                 reason=f"Stop Loss Liquidate (-{pos.stop_loss_price})",
-                order_ref=pos.position_id
+                order_ref=pos.position_id,
+                exchange_order_id=pos.tp_order_id
             ))
 
         return actions

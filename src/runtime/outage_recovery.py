@@ -86,6 +86,7 @@ class OutageRecoveryEngine:
             'liquidated_stops': [],
             'reconciled_tps': [],
             'healthy_positions': [],
+            'adopted_inventory': [],
             'bridged_bars': {}
         }
 
@@ -100,6 +101,11 @@ class OutageRecoveryEngine:
         self._bridge_downtime_candles(summary)
 
         # ----------------------------------------------------------------------
+        # Phase 2.5: Audit Exchange Inventory & Adopt Untracked Holdings
+        # ----------------------------------------------------------------------
+        self._audit_and_adopt_exchange_inventory(summary)
+
+        # ----------------------------------------------------------------------
         # Phase 3: Evaluate Open Positions against Downtime Market Action
         # ----------------------------------------------------------------------
         self._reconcile_open_positions(summary)
@@ -107,6 +113,17 @@ class OutageRecoveryEngine:
         # ----------------------------------------------------------------------
         # Phase 4: Commit Healed State & Record Telemetry Snapshot
         # ----------------------------------------------------------------------
+        if self.mode == "live" and self.binance_adapter:
+            try:
+                usd_bal = self.binance_adapter.get_asset_balance('USD')
+                live_usd = float(usd_bal.get('free', 0.0))
+                if live_usd > 0.0:
+                    self.portfolio.free_cash = live_usd
+                tot_live_eq = self.portfolio.get_total_equity()
+                self.portfolio.initial_capital = tot_live_eq
+            except Exception as e:
+                logger.warning(f"Could not refresh live USD balance after recovery: {e}")
+
         if self.portfolio_db:
             self.portfolio.save_state(self.portfolio_db)
             logger.info("Saved healed portfolio state to SQLite.")
@@ -125,11 +142,12 @@ class OutageRecoveryEngine:
 
         print("-" * 95)
         print(f"✅ OUTAGE RECOVERY COMPLETE:")
-        print(f"   • Stale Buys Cancelled   : {len(summary['cancelled_buys'])}")
-        print(f"   • Stop Losses Liquidated : {len(summary['liquidated_stops'])}")
-        print(f"   • Take Profits Reconciled: {len(summary['reconciled_tps'])}")
-        print(f"   • Healthy Positions Kept : {len(summary['healthy_positions'])}")
-        print(f"   • Total Equity Post-Heal : ${tot_eq:,.2f} | Free Cash: ${self.portfolio.free_cash:,.2f}")
+        print(f"   • Stale Buys Cancelled     : {len(summary['cancelled_buys'])}")
+        print(f"   • Untracked Inventory Found: {len(summary['adopted_inventory'])}")
+        print(f"   • Stop Losses Liquidated   : {len(summary['liquidated_stops'])}")
+        print(f"   • Take Profits Reconciled  : {len(summary['reconciled_tps'])}")
+        print(f"   • Healthy Positions Kept   : {len(summary['healthy_positions'])}")
+        print(f"   • Total Equity Post-Heal   : ${tot_eq:,.2f} | Free Cash: ${self.portfolio.free_cash:,.2f}")
         print("=" * 95 + "\n")
 
         return summary
@@ -239,6 +257,131 @@ class OutageRecoveryEngine:
             else:
                 logger.info(f"  • {sym:<8}: Already up to date.")
 
+    def _audit_and_adopt_exchange_inventory(self, summary: Dict[str, Any]) -> None:
+        """
+        Audits live Binance.US account balances for any spot inventory held across the active universe.
+        If coins (e.g. XRP) are held on Binance.US that are not currently tracked in active_positions,
+        it fetches recent trade history, calculates target TP (+x* + 0.30%) and Stop (-y*),
+        and adopts the position into active_positions so it can be managed and exited profitably.
+        """
+        if self.mode != "live" or not self.binance_adapter:
+            return
+
+        logger.info("Phase 2.5: Auditing Binance.US asset balances for untracked inventory...")
+        try:
+            balances = self.binance_adapter.get_account_balances()
+        except Exception as e:
+            logger.error(f"Failed to fetch account balances for inventory audit: {e}")
+            return
+
+        for ksym, champ in CRYPTO_CHAMPIONS.items():
+            bsym = champ.get('binance_sym', ksym)
+            base_asset = bsym.replace("USDT", "").replace("USD", "")
+            bal = balances.get(base_asset, {'free': 0.0, 'locked': 0.0, 'total': 0.0})
+            total_qty = bal.get('total', 0.0)
+            if total_qty <= 0.0:
+                continue
+
+            cur_p = self._get_current_price(bsym)
+            if cur_p <= 0.0:
+                continue
+
+            notional = total_qty * cur_p
+            # Only adopt if notional value is meaningful (> $5.00)
+            if notional < 5.0:
+                continue
+
+            if ksym in self.portfolio.active_positions:
+                pos = self.portfolio.active_positions[ksym]
+                if abs(pos.quantity - total_qty) > 0.0001:
+                    logger.info(f"Synchronizing position quantity for {ksym}: {pos.quantity} -> {total_qty}")
+                    pos.quantity = total_qty
+                continue
+
+            # Untracked holding detected! Adopt it.
+            logger.warning(
+                f"🚨 [INVENTORY AUDIT] Detected untracked holding on Binance.US: "
+                f"{total_qty} {base_asset} (~${notional:,.2f} USD). Adopting into active positions."
+            )
+
+            # Look up recent buy trade for entry price
+            entry_price = cur_p
+            trade_time = None
+            try:
+                recent_trades = self.binance_adapter.get_recent_fills(bsym, limit=10)
+                buy_trades = [t for t in recent_trades if t.get('isBuyer', True)]
+                if buy_trades:
+                    latest = buy_trades[-1]
+                    entry_price = float(latest.get('price', cur_p))
+                    trade_time = latest.get('time')
+            except Exception as e:
+                logger.warning(f"Could not retrieve recent trades for {bsym}: {e}. Using current price ${cur_p:,.4f}.")
+
+            x_star = champ['x_star']
+            y_star = champ['y_star']
+            prem = getattr(self.portfolio, 'sell_premium_pct', 0.30)
+            limit_sell_price = round(entry_price * (1.0 + (x_star + prem) / 100.0), 4)
+            stop_loss_price = round(entry_price * (1.0 - y_star / 100.0), 4)
+            alloc_cap = entry_price * total_qty
+            pos_id = f"POS_{ksym}_{int(time.time())}"
+
+            # Check if there is already an open sell order for this symbol on Binance
+            tp_order_id = None
+            try:
+                open_orders = self.binance_adapter.get_open_orders(bsym)
+                for o in open_orders:
+                    if o.get('side', '').upper() == 'SELL':
+                        tp_order_id = str(o.get('orderId'))
+                        break
+            except Exception:
+                pass
+
+            pos = ActivePosition(
+                position_id=pos_id,
+                symbol=ksym,
+                binance_symbol=bsym,
+                entry_price=entry_price,
+                quantity=total_qty,
+                allocated_capital=alloc_cap,
+                limit_sell_price=limit_sell_price,
+                stop_loss_price=stop_loss_price,
+                entry_timestamp=datetime.fromtimestamp(trade_time / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M:%S") if trade_time else str(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S")),
+                bars_held=0,
+                tp_order_id=tp_order_id,
+                status="OPEN"
+            )
+            self.portfolio.active_positions[ksym] = pos
+
+            self.ledger.log_order_event(
+                event_type="INVENTORY_ADOPTED",
+                symbol=ksym,
+                binance_symbol=bsym,
+                side="BUY",
+                order_type="LIMIT",
+                price=entry_price,
+                quantity=total_qty,
+                allocated_capital=alloc_cap,
+                order_id=pos_id,
+                exchange_order_id=tp_order_id,
+                reason="Adopted untracked live inventory from exchange audit",
+                status="OPEN"
+            )
+
+            summary['adopted_inventory'].append({
+                'symbol': ksym,
+                'binance_symbol': bsym,
+                'quantity': total_qty,
+                'entry_price': entry_price,
+                'notional': notional,
+                'tp_target': limit_sell_price,
+                'stop_loss': stop_loss_price
+            })
+
+            logger.info(
+                f"✅ [ADOPTED POSITION] {ksym} ({bsym}) | Qty: {total_qty} | Entry: ${entry_price:,.4f} | "
+                f"TP Sell Target: ${limit_sell_price:,.4f} (+{x_star + prem:.2f}%) | Stop: ${stop_loss_price:,.4f} (-{y_star:.2f}%)"
+            )
+
     def _reconcile_open_positions(self, summary: Dict[str, Any]) -> None:
         """
         Evaluates active positions against candles closed during downtime.
@@ -296,16 +439,39 @@ class OutageRecoveryEngine:
                     logger.error(f"Error checking TP order status on Binance.US for {bsym}: {e}")
 
             if not tp_filled:
-                # Check if high breached TP in downtime candles
-                for c in downtime_candles:
-                    if c['high'] >= pos.limit_sell_price:
+                # Check if current price or downtime high reached TP
+                tp_reached = (current_price >= pos.limit_sell_price)
+                if not tp_reached:
+                    for c in downtime_candles:
+                        if c['high'] >= pos.limit_sell_price:
+                            tp_reached = True
+                            break
+
+                if tp_reached:
+                    if self.mode == "live" and self.binance_adapter:
+                        logger.info(
+                            f"🎉 [OUTAGE TP REACHED] {ksym} ({bsym}) is ITM at ${current_price:,.4f} >= TP ${pos.limit_sell_price:,.4f}! "
+                            f"Executing monitored limit liquidation on Binance.US to bank profit..."
+                        )
+                        # Cancel any resting sell order if it was open
+                        if pos.tp_order_id:
+                            try:
+                                self.binance_adapter.cancel_order(bsym, order_id=pos.tp_order_id)
+                            except Exception:
+                                pass
+                        try:
+                            sell_res = self.binance_adapter.execute_monitored_limit_sell(bsym, pos.quantity)
+                            tp_filled = True
+                            tp_fill_price = current_price
+                        except Exception as e:
+                            logger.error(f"Failed to execute live TP limit liquidation for {bsym}: {e}")
+                    else:
                         tp_filled = True
-                        break
 
             if tp_filled:
                 logger.info(
-                    f"🎉 [OUTAGE TP FILL] {ksym} ({bsym}) hit Take-Profit while offline! "
-                    f"TP=${pos.limit_sell_price:,.2f}"
+                    f"🎉 [OUTAGE TP FILL] {ksym} ({bsym}) hit Take-Profit! "
+                    f"TP=${tp_fill_price:,.4f}"
                 )
                 self._reconcile_outage_tp(ksym, pos, tp_fill_price, summary)
                 continue
