@@ -25,6 +25,7 @@ import logging
 from pathlib import Path
 from typing import Dict, List, Optional, Any, Union
 from datetime import datetime, timezone
+from dataclasses import asdict, is_dataclass
 
 logger = logging.getLogger("accretion.ledger.activity")
 
@@ -245,8 +246,20 @@ class ActivityLedger:
     ) -> None:
         """Logs a real-time portfolio snapshot for Android app monitoring."""
         now = datetime.now(timezone.utc)
-        pos_json = json.dumps({s: (p.to_dict() if hasattr(p, 'to_dict') else (asdict(p) if hasattr(p, '__dataclass_fields__') else p)) for s, p in active_positions.items()})
-        orders_json = json.dumps({s: (o.to_dict() if hasattr(o, 'to_dict') else (asdict(o) if hasattr(o, '__dataclass_fields__') else o)) for s, o in resting_orders.items()})
+
+        def _serialize_item(item: Any) -> Any:
+            if hasattr(item, 'to_dict') and callable(getattr(item, 'to_dict')):
+                return item.to_dict()
+            if is_dataclass(item):
+                return asdict(item)
+            if hasattr(item, '__dataclass_fields__'):
+                return asdict(item)
+            if isinstance(item, dict):
+                return item
+            return str(item)
+
+        pos_json = json.dumps({s: _serialize_item(p) for s, p in active_positions.items()})
+        orders_json = json.dumps({s: _serialize_item(o) for s, o in resting_orders.items()})
 
         with self._get_connection() as conn:
             conn.execute("""

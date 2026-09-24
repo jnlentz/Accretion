@@ -80,6 +80,9 @@ class RestingBuyOrder:
     exchange_order_id: Optional[str] = None
     status: str = "PENDING"  # PENDING, FILLED, CANCELED
 
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
+
 
 @dataclass
 class ActivePosition:
@@ -95,6 +98,9 @@ class ActivePosition:
     bars_held: int = 0
     tp_order_id: Optional[str] = None
     status: str = "OPEN"  # OPEN, CLOSED_TP, CLOSED_STOP
+
+    def to_dict(self) -> Dict[str, Any]:
+        return asdict(self)
 
 
 class CryptoPortfolioEngine:
