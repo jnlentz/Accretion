@@ -14,15 +14,13 @@ Purpose:
     8. Lossless state persistence across restarts to state/crypto_live_portfolio.sqlite.
 
 Usage:
-  python scripts/run_crypto_live_strategy.py --mode paper
-  python scripts/run_crypto_live_strategy.py --mode live
+  python scripts/run_crypto_live_strategy.py
 ====================================================================================================
 """
 
 import sys
 import os
 import time
-import argparse
 import logging
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -34,6 +32,19 @@ import pandas as pd
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+# ==============================================================================
+# STRATEGY & RUNTIME CONFIGURATION (USER-TUNABLE VARIABLES)
+# ==============================================================================
+EXECUTION_MODE: str = "live"             # "live" (Binance.US REST) or "paper" (simulation)
+MAX_HOLD_HOURS: float = 12.0             # Champion maximum holding duration in hours (12h = 48 bars)
+MAX_SLOTS: int = 2                       # Concurrency slots (Max 2 simultaneous open positions/resting orders)
+POSITION_SIZE_FRACTION: float = 0.50     # Compounded equity sizing fraction per slot (50%)
+DISCOUNT_PCT: float = 0.50               # Maker limit buy discount below close (-0.50%)
+SELL_PREMIUM_PCT: float = 0.30           # Maker limit TP premium above target (+0.30%)
+ORDER_TTL_BARS: int = 1                  # Resting limit buy order TTL in 15m bars (1 bar = 15 min)
+INITIAL_CAPITAL: Optional[float] = None  # None fetches live balance from Binance.US (or $10,000 in paper)
+# ==============================================================================
 
 # Sklearn unpickling compatibility shim
 from research_import.crypto_live_engine import (
@@ -78,13 +89,14 @@ class CryptoLiveStrategyRunner:
 
     def __init__(
         self,
-        mode: str = "paper",
-        initial_capital: Optional[float] = None,
-        max_slots: int = 2,
+        mode: str = EXECUTION_MODE,
+        initial_capital: Optional[float] = INITIAL_CAPITAL,
+        max_slots: int = MAX_SLOTS,
         symbols: Optional[List[str]] = None,
-        discount_pct: float = 0.50,
-        sell_premium_pct: float = 0.30,
-        order_ttl_bars: int = 1
+        discount_pct: float = DISCOUNT_PCT,
+        sell_premium_pct: float = SELL_PREMIUM_PCT,
+        order_ttl_bars: int = ORDER_TTL_BARS,
+        max_holding_bars: Optional[int] = None
     ):
         self.mode = mode.lower()
         self.symbols = symbols or list(CRYPTO_CHAMPIONS.keys())
@@ -142,6 +154,8 @@ class CryptoLiveStrategyRunner:
         if self.config_path.exists():
             self.inference_engine.load_models_from_dir(self.models_dir, config_path=self.config_path)
 
+        holding_bars = max_holding_bars if max_holding_bars is not None else int(round(MAX_HOLD_HOURS * 4))
+
         self.portfolio = CryptoPortfolioEngine(
             initial_capital=actual_capital,
             max_slots=max_slots,
@@ -149,7 +163,8 @@ class CryptoLiveStrategyRunner:
             discount_pct=discount_pct,
             sell_premium_pct=sell_premium_pct,
             order_ttl_bars=order_ttl_bars,
-            min_notional_usd=10.0
+            min_notional_usd=10.0,
+            max_holding_bars=holding_bars
         )
 
         # Restore state if previously persisted
@@ -232,6 +247,7 @@ class CryptoLiveStrategyRunner:
         print(f"Concurrency Slots (K)   : {self.portfolio.max_slots} Slots | 50% Compounded Equity Sizing")
         print(f"Execution Geometry      : Buy Discount -{self.portfolio.discount_pct:.2f}% | Sell Premium +{self.portfolio.sell_premium_pct:.2f}%")
         print(f"Order TTL               : {self.portfolio.order_ttl_bars} Bar(s) ({self.portfolio.order_ttl_bars * 15} min)")
+        print(f"Max Holding Duration    : {self.portfolio.max_holding_bars * 15 / 60:.1f} Hours ({self.portfolio.max_holding_bars} bars)")
         print(f"Zero-Market-Order Stop  : Monitored Pegged Limit Sell (-y*)")
         print(f"Activity Database       : {self.activity_ledger.db_path.name} (WAL Mode)")
         print("=" * 95 + "\n")
@@ -306,19 +322,26 @@ class CryptoLiveStrategyRunner:
                 logger.warning(f"Error updating Binance prices: {e}")
 
     def _tick_order_lifecycle(self) -> None:
-        """Monitors resting orders, fills, and stop loss conditions."""
-        # 1. Check Stop Losses (Zero-Market-Order Monitored Liquidation)
+        """Monitors resting orders, fills, stop loss conditions, and max hold timeouts."""
         prev_trades_count = len(self.portfolio.closed_trades)
+
+        # 1. Check Stop Losses (Zero-Market-Order Monitored Liquidation)
         stop_actions = self.portfolio.check_stop_losses(self.current_ticker_prices)
         for act in stop_actions:
             self._execute_action(act)
 
-        # Log newly closed stop trades to activity ledger
+        # 2. Check Champion 12-Hour Max Hold Timeouts (Zero-Market-Order Monitored Liquidation)
+        timeout_actions = self.portfolio.check_max_hold_timeouts(self.current_ticker_prices)
+        for act in timeout_actions:
+            self._execute_action(act)
+
+        # Log newly closed stop or max hold timeout trades to activity ledger
         if len(self.portfolio.closed_trades) > prev_trades_count:
             for tr in self.portfolio.closed_trades[prev_trades_count:]:
                 self.activity_ledger.log_completed_trade(tr)
+                event_type = "MAX_HOLD_LIQUIDATED" if tr.get('exit_reason') == "MAX_HOLD_TIMEOUT" else "STOP_LIQUIDATED"
                 self.activity_ledger.log_order_event(
-                    event_type="STOP_LIQUIDATED",
+                    event_type=event_type,
                     symbol=tr['symbol'],
                     binance_symbol=tr['binance_symbol'],
                     side="SELL",
@@ -326,12 +349,12 @@ class CryptoLiveStrategyRunner:
                     price=tr['exit_price'],
                     quantity=tr['quantity'],
                     allocated_capital=tr['allocated_capital'],
-                    reason="Stop Loss Barrier Hit (-y*)",
+                    reason=f"Exit: {tr.get('exit_reason')}",
                     status="FILLED",
-                    details={'dollar_pnl': tr['dollar_pnl'], 'net_ret_pct': tr['net_ret_pct']}
+                    details={'dollar_pnl': tr['dollar_pnl'], 'net_ret_pct': tr['net_ret_pct'], 'bars_held': tr.get('bars_held')}
                 )
 
-        # 2. Check Order Fills
+        # 3. Check Order Fills
         if self.mode == "live":
             self._poll_live_order_fills()
         elif self.mode == "paper":
@@ -812,28 +835,30 @@ class CryptoLiveStrategyRunner:
             for sym, p in self.portfolio.active_positions.items():
                 cur_p = self.current_ticker_prices.get(p.binance_symbol, p.entry_price)
                 unrealized = ((cur_p - p.entry_price) / p.entry_price) * 100.0
-                print(f"  • {sym:<8} -> {p.binance_symbol:<8} | Entry: ${p.entry_price:,.2f} | Cur: ${cur_p:,.2f} ({unrealized:+.2f}%) | TP: ${p.limit_sell_price:,.2f} | Stop: ${p.stop_loss_price:,.2f}")
+                print(
+                    f"  • {sym:<8} -> {p.binance_symbol:<8} | Entry: ${p.entry_price:,.2f} | Cur: ${cur_p:,.2f} ({unrealized:+.2f}%) | "
+                    f"TP: ${p.limit_sell_price:,.2f} | Stop: ${p.stop_loss_price:,.2f} | "
+                    f"Held: {p.bars_held}/{self.portfolio.max_holding_bars} bars ({p.bars_held * 15 / 60:.1f}h)"
+                )
 
         print("-" * 95 + "\n")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="24/7 Crypto Live Strategy Runner (Policy 4 RVOL)")
-    parser.add_argument("--mode", type=str, default="paper", choices=["paper", "live"], help="Execution mode (paper or live)")
-    parser.add_argument("--initial-capital", type=float, default=None, help="Initial portfolio capital ($ USD). In live mode, automatically fetches live USD balance from Binance.US if omitted.")
-    parser.add_argument("--slots", type=int, default=2, help="Concurrency slots (default: 2)")
-    parser.add_argument("--discount", type=float, default=0.50, help="Maker limit buy discount %% (default: 0.50)")
-    parser.add_argument("--premium", type=float, default=0.30, help="Maker limit TP sell premium %% (default: 0.30)")
-    parser.add_argument("--ttl", type=int, default=1, help="Order TTL in 15m bars (default: 1)")
-    args = parser.parse_args()
-
+    """
+    Main entry point for continuous execution.
+    All runtime parameters are tuned via configuration variables at the top of this script.
+    No console/CLI arguments needed.
+    """
+    holding_bars = int(round(MAX_HOLD_HOURS * 4))
     runner = CryptoLiveStrategyRunner(
-        mode=args.mode,
-        initial_capital=args.initial_capital,
-        max_slots=args.slots,
-        discount_pct=args.discount,
-        sell_premium_pct=args.premium,
-        order_ttl_bars=args.ttl
+        mode=EXECUTION_MODE,
+        initial_capital=INITIAL_CAPITAL,
+        max_slots=MAX_SLOTS,
+        discount_pct=DISCOUNT_PCT,
+        sell_premium_pct=SELL_PREMIUM_PCT,
+        order_ttl_bars=ORDER_TTL_BARS,
+        max_holding_bars=holding_bars
     )
     runner.run()
 

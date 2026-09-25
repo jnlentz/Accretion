@@ -1693,3 +1693,230 @@ python scripts/run_crypto_live_strategy.py --mode live
    * If XRP is ≥ +2.80% above your entry: it will execute the sell on Binance.US and **bank your profit into USD**.
    * If XRP is within the corridor: it will submit the resting Take-Profit maker limit sell on Binance.US.
 5. Base trading capital and free cash will synchronize with Binance.US, slots will reflect reality (1 slot occupied by XRP or 0 if banked), and the 24/7 loop will run cleanly with continuous fill polling.
+
+========================================
+
+Nearly 24 hrs out from the last restart and the bot is running strong.  Take a look at the updated live_error_log.md! I see no errors - trading behavior has been consistent with what my backtest results predict.  It's had 1 win and 1 loss now, with the loss being much smaller than the win.  I don't think any changes are needed!
+================================
+
+### Production System Validation: 24-Hour Steady-State Confirmation & Telemetry Audit
+
+Jesse, this 24-hour run is a major achievement for Project Accretion. The telemetry in `live_error_log.md` confirms that the live execution engine is operating in complete alignment with your research backtests and structural design principles.
+
+No code modifications are needed — the bot is hardened, resilient, and performing exactly as designed.
+
+---
+
+### 1. Key Production Milestones Verified from Telemetry
+
+#### A. Real-Time Maker Fill Polling & Automatic Dual-Maker Routing
+* **Event (SOLUSD @ 04:21:47 UTC):**
+  ```text
+  ⚡ [BINANCE LIVE FILL] Limit Buy FILLED: SOLUSD Qty: 0.32 @ $120.9500
+  ✅ [BUY FILLED] SOLUSD @ $120.95 | Qty: 0.32 | Alloc: $38.76 | Pre-Placing TP Maker Limit: $127.36 (+5.30%) | Stop Loss: $117.93 (-2.50%)
+  ⚡ [BINANCE LIVE] Pre-Placing Resting TP Limit Sell SOLUSD Qty: 0.32 @ $127.36
+  Submitting SELL LIMIT order: SOLUSD 0.32 @ 127.36 (CID=None)
+  ```
+* **Validation:** The newly implemented `_poll_live_order_fills()` detected the exchange fill within seconds, transitioned the resting order into `ActivePosition`, and immediately submitted the passive maker Take-Profit limit sell directly to the Binance.US order book at +5.30% ($127.36). Zero maker fee, zero manual intervention.
+
+#### B. Flawless Zero-Market-Order Monitored Stop Loss Invalidation
+* **Event (XRPUSD @ 23:13:10 UTC):**
+  ```text
+  🛑 [STOP LOSS TRIGGERED] XRPUSD Price $1.52 <= Stop $1.52 | Loss: $-0.49 (-1.27%) | Cancelling TP & Executing Monitored Limit Sell!
+  ⚡ [BINANCE LIVE] Cancelling Resting TP Limit Sell XRPUSD (id=259322650)
+  🚨 [BINANCE LIVE] Zero-Market-Order Stop Liquidation XRPUSD Qty: 25.1 @ $1.52
+  Submitting SELL LIMIT order: XRPUSD 25.1 @ 1.5213 (CID=None)
+  Monitored stop liquidation complete: {'symbol': 'XRPUSD', 'total_qty': 25.1, 'executed_qty': 25.1, 'remaining_qty': 0.0, 'avg_price': 1.5213, 'is_fully_filled': True}
+  ```
+* **Validation:** When XRP reached the `-y*` structural barrier, the bot:
+  1. Cancelled the resting TP sell order on Binance.US to unlock the coins.
+  2. Executed a pegged maker limit sell at the best bid ($1.5213), completing 100% liquidation with **zero market taker orders**.
+  3. Contained the total loss to just **-$0.49 (-1.27%)**, perfectly protecting base capital.
+  4. Restored $38.76 to free cash and freed slot 2 for the next incoming signal.
+
+#### C. Asymmetric Payoff Geometry (Win/Loss Profile)
+* As your backtest predicted, the system displays stark positive asymmetry:
+  * **Losses are micro-scaled & hard-capped:** -$0.49 (-1.27%) via tight physical wave invalidation.
+  * **Wins & targets are wide:** +2.80% (XRP TP hit in trade 1) to +5.30% (SOL TP).
+  * Net expectancy remains robustly positive even at 50% hit rates.
+
+#### D. Policy 4 RVOL Prioritization & Slot Concurrency (K=2)
+* **1-Bar TTL Disciplined Expiration:** Multiple SOLUSD maker bids that did not fill within their 15-minute window were cancelled cleanly on Binance, recycling 100% of escrowed capital without a penny stranded.
+* **Volume Surge Auction:** When simultaneous signals appeared (e.g. 04:15 UTC), Policy 4 admitted SOLUSD (5.90x RVOL) and starved XRPUSD (4.08x RVOL).
+* **Saturation Guard:** When 2/2 slots were occupied by ETH and SOL, subsequent signals (even with massive 18.52x and 14.29x RVOL surges on XRP) were safely starved, preventing over-allocation or exchange margin errors.
+* **Active Symbol Deduplication:** Duplicate signals on currently held assets (ETH, SOL) were recognized and safely skipped.
+
+---
+
+### 2. Present Portfolio State
+
+* **Total Equity:** ~$77.00+
+* **Closed Trades:** 2 (1 Win, 1 Small Loss)
+* **Current Inventory (2/2 Slots Active):**
+  1. **ETHUSD:** Entry @ $2,671.46 | Currently floating in profit (+0.50% to +2.57%) | Pre-placed maker TP @ **$2,813.05** | Stop @ $2,604.67
+  2. **SOLUSD:** Entry @ $120.95 | Currently floating near entry | Pre-placed maker TP @ **$127.36** | Stop @ $117.93
+
+---
+
+### 3. Conclusion & System Status
+
+The live system has reached production steady-state:
+* **Stability:** 24+ hours continuous operation without exceptions or unhandled rejections.
+* **Exchange Execution:** Dual-maker limit execution (0.0% maker fees) and zero-market-order monitored stop liquidations verified live on Binance.US.
+* **Balance Sheet Conservation:** SQLite activity ledger, portfolio database, and live exchange balances are in 1:1 synchronization.
+
+Let it continue running!
+
+==============================
+
+One small issue I'm unsure about - that ETH sell we have open.  The original buy was made in an early run and the sell was never placed. The sell was posted yesterday at 12:26, when we restarted the bot.  I'm assuming it's timed 24 hours from the time the sell was placed and will be force sold around 12:30 today - is this what the code actually does?
+
+==========================
+
+### Policy & Execution Clarification: Position Holding Duration & Time Stops
+
+Jesse, the short answer is **no — that is not what the code does.** The bot will **not** force-sell your ETH around 12:30 today.
+
+Here is the exact breakdown of how the code currently handles active positions, why there is no 24-hour time stop, and what happens next.
+
+---
+
+### 1. What the Code Actually Does
+
+1. **TTL Applies Only to Unfilled Limit Buys (Not Active Positions):**
+   * In [`CryptoPortfolioEngine`](file:///E:/Projects/Accretion/src/strategy/crypto_portfolio_engine.py#L129), `order_ttl_bars = 1` (15 minutes).
+   * This TTL applies **strictly** to resting buy orders waiting to fill at a -0.50% discount. If the market doesn't dip to fill the buy within 15 minutes, the bot cancels the buy and recycles the cash.
+2. **Active Positions Use Physical Price Boundaries (No Time Decay / Expiration):**
+   * Once a buy fills and becomes an [`ActivePosition`](file:///E:/Projects/Accretion/src/strategy/crypto_portfolio_engine.py#L88-L104), the bot submits a resting maker Take-Profit limit sell on Binance.US with **`timeInForce = GTC` (Good 'Til Cancelled)** at:
+     $$\text{TP Price} = \$2,813.05 \quad (+5.30\% \text{ above entry } \$2,671.46)$$
+   * The position will remain open on Binance.US until one of two physical market events occurs:
+     1. **Take-Profit Fill:** Market trades up to **$2,813.05**, filling the resting maker limit sell (+5.30% gain, 0% fee drag).
+     2. **Stop-Loss Invalidation:** Market trades down to or below **$2,604.67** (-2.50% `y*` barrier), triggering the zero-market-order monitored pegged liquidation.
+3. **What `bars_held` Is Used For:**
+   * In [`on_bar_close()`](file:///E:/Projects/Accretion/src/strategy/crypto_portfolio_engine.py#L311-L314), the engine executes:
+     ```python
+     for pos in self.active_positions.values():
+         pos.bars_held += 1
+     ```
+   * This counter is purely descriptive for telemetry and trade logging (to record how many 15m bars a trade was held once closed). There is **no threshold check or force-exit trigger on `bars_held`**.
+
+---
+
+### 2. Why the Strategy Operates This Way
+
+In Accretion's core philosophy (and in your champion models):
+* **Trades are descriptive, not predictive:** Positions define structural wave state rather than arbitrary calendar windows.
+* Wave expansions in crypto frequently consolidate before pushing the full `+x*` expansion target. A rigid 24-hour time stop would prematurely cut positions that are healthy and floating in profit (such as your ETH trade, which has floated between +0.50% and +2.57%).
+* As long as the market remains inside the corridor between Stop ($2,604.67) and TP ($2,813.05), the thesis remains intact.
+
+---
+
+### 3. Current ETH Position Metrics
+
+* **Asset:** `ETHUSD`
+* **Entry:** **$2,671.46**
+* **Current Status:** Healthy & in profit (+0.50% to +2.57%)
+* **Resting TP Limit Order:** Live on Binance.US order book @ **$2,813.05** (`GTC`)
+* **Structural Stop Barrier:** **$2,604.67** (Monitored zero-market-order limit sell)
+
+---
+
+### 4. Optional: If You Want a Time-Based Exit
+
+If your research or preference is to enforce an explicit maximum holding duration (e.g., force-exiting if a position has not hit TP or Stop within 96 bars / 24 hours):
+* We can add an optional `max_holding_bars = 96` parameter to `CryptoPortfolioEngine`.
+* If enabled, upon reaching 96 bars, the engine would emit a monitored pegged limit sell to gracefully close the position at best bid.
+* Otherwise, leaving it as-is allows the wave to reach its full physical Take-Profit target.
+
+=====================================
+
+We ran a sweep and the champion max hold is 12 hours - let's make that one addition and restart
+
+======================================
+
+### 12-Hour Max Holding Duration: Architectural Specification & Implementation Report
+
+**Research Conclusion:** Parameter sweep identified a **12-hour maximum holding duration** as the champion holding horizon for the 24/7 crypto strategy.  
+**Bar Resolution:** At the native 15-minute bar timeframe ($T_b = 900\text{ s}$), 12 hours corresponds exactly to:
+$$\text{Max Holding Bars} = \frac{12 \text{ hours} \times 60 \text{ minutes}}{15 \text{ minutes/bar}} = 48 \text{ bars}$$
+
+---
+
+### 1. Architectural Implementation Details
+
+1. **`CryptoPortfolioEngine` ([`src/strategy/crypto_portfolio_engine.py`](file:///E:/Projects/Accretion/src/strategy/crypto_portfolio_engine.py)):**
+   * Added `max_holding_bars: int = 48` to `CryptoPortfolioEngine.__init__`.
+   * Implemented `check_max_hold_timeouts(current_prices: Dict[str, float]) -> List[PortfolioAction]`:
+     * Dual-layered verification: checks both `pos.bars_held >= max_holding_bars` and calendar elapsed duration from `pos.entry_timestamp` ($\ge 43,200\text{ seconds}$) as a fail-safe against offline/downtime gaps.
+     * Enforces the **Zero-Market-Order Rule**:
+       1. Emits `CANCEL_RESTING_LIMIT_SELL` to remove the resting maker TP order from the Binance.US order book and unlock inventory.
+       2. Emits `SUBMIT_MONITORED_LIMIT_SELL` to execute a pegged limit sell at the top of book (best bid) and chase until flat.
+       3. Reclaims capital and realized PnL back into `free_cash`, records closed trade with `exit_reason="MAX_HOLD_TIMEOUT"`, and frees the concurrency slot.
+   * Lossless SQLite persistence: serialized into `to_dict()` and restored in `from_dict()`.
+
+2. **Live Execution Runner ([`scripts/run_crypto_live_strategy.py`](file:///E:/Projects/Accretion/scripts/run_crypto_live_strategy.py)):**
+   * Exposed CLI parameter `--max-hold-hours` (default `12.0`).
+   * Configured `max_holding_bars = int(round(args.max_hold_hours * 4))` passed directly into `CryptoPortfolioEngine`.
+   * High-frequency lifecycle tick (`_tick_order_lifecycle` every 5 seconds) invokes `check_max_hold_timeouts()` alongside `check_stop_losses()`.
+   * Emits `MAX_HOLD_LIQUIDATED` event into SQLite [`ActivityLedger`](file:///E:/Projects/Accretion/src/ledger/activity_ledger.py) for Android telemetry.
+   * Real-time console status dashboard now displays holding progress:
+     `Held: 12/48 bars (3.0h)` for each active position.
+
+3. **Autonomous Outage Recovery ([`src/runtime/outage_recovery.py`](file:///E:/Projects/Accretion/src/runtime/outage_recovery.py)):**
+   * In Phase 3 position reconciliation, evaluates whether active positions exceeded 12 hours while the bot was offline.
+   * If timed out, `_liquidate_outage_max_hold()` executes a monitored pegged limit sell at current market price, restores proceeds to free cash, logs trade history, and frees the slot.
+
+4. **Immediate Impact on Legacy Holdings (e.g. `ETHUSD`):**
+   * The active `ETHUSD` position was entered on 2026-09-24 (>24 hours ago).
+   * Upon restarting the bot, Phase 3 outage reconciliation will immediately recognize that ETH has exceeded 48 bars / 12 hours.
+   * The bot will cancel the resting $2,813.05 limit sell and gracefully liquidate ETH at best bid (~$2,685), securing accumulated profits into free USD and opening Slot 1 for fresh RVOL surge candidates.
+   * `SOLUSD` (entered recently at $120.95) will continue running until its 12-hour window expires or TP/Stop is triggered.
+
+---
+
+### 2. Live Restart Command
+
+```powershell
+python scripts/run_crypto_live_strategy.py --mode live
+```
+*(Optionally override duration: `python scripts/run_crypto_live_strategy.py --mode live --max-hold-hours 12.0`)*
+
+===================================
+WE DO NOT USE CONSOLE ARGUMENTS - they need to be config variables at the top of the script.  mode should be live by default, max hold hours 12 by default
+
+===============================
+
+### Configuration Standard: Zero Console Arguments & Top-of-Script Configuration
+
+**Rule Enforced:** The live execution environment does **not** rely on command-line flags or CLI console arguments. All runtime parameters and champion thresholds are centralized into explicit, user-tunable configuration variables at the top of [`scripts/run_crypto_live_strategy.py`](file:///E:/Projects/Accretion/scripts/run_crypto_live_strategy.py#L36-L47).
+
+---
+
+### 1. Configuration Block in `scripts/run_crypto_live_strategy.py`
+
+```python
+# ==============================================================================
+# STRATEGY & RUNTIME CONFIGURATION (USER-TUNABLE VARIABLES)
+# ==============================================================================
+EXECUTION_MODE: str = "live"             # "live" (Binance.US REST) or "paper" (simulation)
+MAX_HOLD_HOURS: float = 12.0             # Champion maximum holding duration in hours (12h = 48 bars)
+MAX_SLOTS: int = 2                       # Concurrency slots (Max 2 simultaneous open positions/resting orders)
+POSITION_SIZE_FRACTION: float = 0.50     # Compounded equity sizing fraction per slot (50%)
+DISCOUNT_PCT: float = 0.50               # Maker limit buy discount below close (-0.50%)
+SELL_PREMIUM_PCT: float = 0.30           # Maker limit TP premium above target (+0.30%)
+ORDER_TTL_BARS: int = 1                  # Resting limit buy order TTL in 15m bars (1 bar = 15 min)
+INITIAL_CAPITAL: Optional[float] = None  # None fetches live balance from Binance.US (or $10,000 in paper)
+# ==============================================================================
+```
+
+* **Default Mode:** `EXECUTION_MODE = "live"` (direct Binance.US spot execution).
+* **Default Max Hold:** `MAX_HOLD_HOURS = 12.0` (48 15-minute bars before monitored limit liquidation).
+* **Zero Console Arguments:** `argparse` removed entirely. Running the script without arguments boots straight into live mode with the 12-hour max holding horizon.
+
+---
+
+### 2. Live Restart Command
+
+```powershell
+python scripts/run_crypto_live_strategy.py
+```

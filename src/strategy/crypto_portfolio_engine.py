@@ -118,7 +118,8 @@ class CryptoPortfolioEngine:
         discount_pct: float = 0.50,
         sell_premium_pct: float = 0.30,
         order_ttl_bars: int = 1,
-        min_notional_usd: float = 10.0
+        min_notional_usd: float = 10.0,
+        max_holding_bars: int = 48
     ):
         self.initial_capital = float(initial_capital)
         self.free_cash = float(initial_capital)
@@ -128,6 +129,7 @@ class CryptoPortfolioEngine:
         self.sell_premium_pct = float(sell_premium_pct)
         self.order_ttl_bars = int(order_ttl_bars)
         self.min_notional_usd = float(min_notional_usd)
+        self.max_holding_bars = int(max_holding_bars)
 
         # In-memory tracking registers
         self.resting_orders: Dict[str, RestingBuyOrder] = {}   # {symbol: RestingBuyOrder}
@@ -492,6 +494,94 @@ class CryptoPortfolioEngine:
 
         return actions
 
+    def check_max_hold_timeouts(self, current_prices: Dict[str, float]) -> List[PortfolioAction]:
+        """
+        Enforces champion 12-hour (48-bar) maximum holding duration.
+        If an active position reaches or exceeds max_holding_bars:
+          1. Cancels the resting TP limit sell order.
+          2. Emits SUBMIT_MONITORED_LIMIT_SELL to liquidate at best bid via monitored pegged limit order.
+          3. Closes position, returns capital + PnL to free cash, and records exit_reason='MAX_HOLD_TIMEOUT'.
+        """
+        actions: List[PortfolioAction] = []
+        timed_out_symbols: List[Tuple[str, float]] = []
+
+        now_dt = pd.Timestamp.now(tz='UTC')
+
+        for sym, pos in list(self.active_positions.items()):
+            cur_p = current_prices.get(pos.binance_symbol, pos.entry_price)
+
+            # Check both bars_held counter and elapsed calendar time as safety net against downtime
+            is_timeout = (pos.bars_held >= self.max_holding_bars)
+            if not is_timeout and pos.entry_timestamp:
+                try:
+                    entry_dt = pd.to_datetime(pos.entry_timestamp, utc=True)
+                    elapsed_sec = (now_dt - entry_dt).total_seconds()
+                    # 48 bars * 900 seconds = 43,200 seconds (12.0 hours)
+                    if elapsed_sec >= (self.max_holding_bars * 900):
+                        is_timeout = True
+                        pos.bars_held = max(pos.bars_held, int(elapsed_sec // 900))
+                except Exception:
+                    pass
+
+            if is_timeout:
+                timed_out_symbols.append((sym, cur_p))
+
+        for sym, cur_p in timed_out_symbols:
+            pos = self.active_positions.pop(sym)
+            net_ret_pct = ((cur_p - pos.entry_price) / pos.entry_price) * 100.0
+            dollar_pnl = pos.allocated_capital * (net_ret_pct / 100.0)
+
+            # Return remaining capital + realized PnL to free cash
+            self.free_cash += pos.allocated_capital + dollar_pnl
+
+            trade_record = {
+                'symbol': sym,
+                'binance_symbol': pos.binance_symbol,
+                'entry_price': pos.entry_price,
+                'exit_price': cur_p,
+                'quantity': pos.quantity,
+                'allocated_capital': pos.allocated_capital,
+                'dollar_pnl': dollar_pnl,
+                'net_ret_pct': net_ret_pct,
+                'exit_reason': "MAX_HOLD_TIMEOUT",
+                'bars_held': pos.bars_held,
+                'entry_time': pos.entry_timestamp,
+                'exit_time': str(pd.Timestamp.now(tz='UTC'))
+            }
+            self.closed_trades.append(trade_record)
+
+            logger.warning(
+                f"⌛ [MAX HOLD TIMEOUT] {sym} held for {pos.bars_held} bars (>= {self.max_holding_bars} bars / 12.0h) | "
+                f"Cur: ${cur_p:,.2f} | Entry: ${pos.entry_price:,.2f} | PnL: ${dollar_pnl:,.2f} ({net_ret_pct:+.2f}%) | "
+                f"Cancelling TP & Executing Monitored Pegged Limit Sell!"
+            )
+
+            # Step 1: Cancel resting TP maker order
+            actions.append(PortfolioAction(
+                action_type=PortfolioActionType.CANCEL_RESTING_LIMIT_SELL,
+                symbol=sym,
+                binance_symbol=pos.binance_symbol,
+                price=pos.limit_sell_price,
+                quantity=pos.quantity,
+                reason=f"Max Hold Timeout ({pos.bars_held} bars >= {self.max_holding_bars})",
+                order_ref=pos.position_id,
+                exchange_order_id=pos.tp_order_id
+            ))
+
+            # Step 2: Zero-Market-Order compliant chased limit liquidation
+            actions.append(PortfolioAction(
+                action_type=PortfolioActionType.SUBMIT_MONITORED_LIMIT_SELL,
+                symbol=sym,
+                binance_symbol=pos.binance_symbol,
+                price=cur_p,
+                quantity=pos.quantity,
+                reason=f"Max Hold Timeout Liquidate ({self.max_holding_bars} bars / 12.0h)",
+                order_ref=pos.position_id,
+                exchange_order_id=pos.tp_order_id
+            ))
+
+        return actions
+
     # ==========================================================================
     # 💾 STATE SERIALIZATION & LOSSLESS PERSISTENCE
     # ==========================================================================
@@ -505,6 +595,7 @@ class CryptoPortfolioEngine:
             'discount_pct': self.discount_pct,
             'sell_premium_pct': self.sell_premium_pct,
             'order_ttl_bars': self.order_ttl_bars,
+            'max_holding_bars': self.max_holding_bars,
             'resting_orders': {s: asdict(o) for s, o in self.resting_orders.items()},
             'active_positions': {s: asdict(p) for s, p in self.active_positions.items()},
             'closed_trades': self.closed_trades
@@ -519,6 +610,7 @@ class CryptoPortfolioEngine:
         self.discount_pct = float(data.get('discount_pct', 0.50))
         self.sell_premium_pct = float(data.get('sell_premium_pct', 0.30))
         self.order_ttl_bars = int(data.get('order_ttl_bars', 1))
+        self.max_holding_bars = int(data.get('max_holding_bars', 48))
 
         self.resting_orders = {}
         for s, o_data in data.get('resting_orders', {}).items():

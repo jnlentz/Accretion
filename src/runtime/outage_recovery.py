@@ -35,6 +35,7 @@ import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Any, Tuple
+import pandas as pd
 
 from src.adapters.kraken_data import KrakenData, INTERVAL_SECONDS_15M
 from src.strategy.crypto_portfolio_engine import (
@@ -84,6 +85,7 @@ class OutageRecoveryEngine:
         summary: Dict[str, Any] = {
             'cancelled_buys': [],
             'liquidated_stops': [],
+            'liquidated_max_holds': [],
             'reconciled_tps': [],
             'healthy_positions': [],
             'adopted_inventory': [],
@@ -145,6 +147,7 @@ class OutageRecoveryEngine:
         print(f"   • Stale Buys Cancelled     : {len(summary['cancelled_buys'])}")
         print(f"   • Untracked Inventory Found: {len(summary['adopted_inventory'])}")
         print(f"   • Stop Losses Liquidated   : {len(summary['liquidated_stops'])}")
+        print(f"   • Max Hold Timeouts Closed : {len(summary['liquidated_max_holds'])}")
         print(f"   • Take Profits Reconciled  : {len(summary['reconciled_tps'])}")
         print(f"   • Healthy Positions Kept   : {len(summary['healthy_positions'])}")
         print(f"   • Total Equity Post-Heal   : ${tot_eq:,.2f} | Free Cash: ${self.portfolio.free_cash:,.2f}")
@@ -476,7 +479,30 @@ class OutageRecoveryEngine:
                 self._reconcile_outage_tp(ksym, pos, tp_fill_price, summary)
                 continue
 
-            # 5. Position is Healthy: Resume Waiting for Sell Signal
+            # 5. Check for Champion 12-Hour Max Holding Duration Timeout
+            max_bars = getattr(self.portfolio, 'max_holding_bars', 48)
+            max_hold_sec = max_bars * 15 * 60  # 48 * 900 = 43,200 seconds (12.0 hours)
+            is_timed_out = (pos.bars_held >= max_bars)
+            if not is_timed_out and pos.entry_timestamp:
+                try:
+                    entry_dt = pd.to_datetime(pos.entry_timestamp, utc=True)
+                    now_dt = pd.Timestamp.now(tz='UTC')
+                    elapsed_sec = (now_dt - entry_dt).total_seconds()
+                    if elapsed_sec >= max_hold_sec:
+                        is_timed_out = True
+                        pos.bars_held = max(pos.bars_held, int(elapsed_sec // 900))
+                except Exception:
+                    pass
+
+            if is_timed_out:
+                logger.warning(
+                    f"⌛ [OUTAGE MAX HOLD TIMEOUT] {ksym} ({bsym}) exceeded 12-hour max hold ({pos.bars_held} bars >= {max_bars})! "
+                    f"Entry=${pos.entry_price:,.2f} | Current=${current_price:,.2f} | Liquidating via Monitored Limit Sell..."
+                )
+                self._liquidate_outage_max_hold(ksym, pos, current_price, summary)
+                continue
+
+            # 6. Position is Healthy: Resume Waiting for Sell Signal
             logger.info(f"🛡️  [POSITION HEALTHY] {ksym} ({bsym}) remains active. Current: ${current_price:,.2f} (Between Stop & TP).")
             self._ensure_resting_tp_active(pos)
             self.ledger.log_order_event(
@@ -497,6 +523,90 @@ class OutageRecoveryEngine:
                 'entry_price': pos.entry_price,
                 'current_price': current_price
             })
+
+    def _liquidate_outage_max_hold(
+        self,
+        symbol: str,
+        pos: ActivePosition,
+        current_price: float,
+        summary: Dict[str, Any]
+    ) -> None:
+        """
+        Liquidates a position that exceeded the 12-hour max holding duration.
+        Enforces Jesse's Zero-Market-Order rule by using a monitored pegged limit sell.
+        """
+        bsym = pos.binance_symbol
+        exit_price = current_price
+
+        # 1. Cancel resting TP order on Binance.US
+        if self.mode == "live" and self.binance_adapter and pos.tp_order_id:
+            logger.info(f"Cancelling resting TP order {pos.tp_order_id} on {bsym} prior to max hold liquidation.")
+            try:
+                self.binance_adapter.cancel_order(symbol=bsym, order_id=pos.tp_order_id)
+            except Exception as e:
+                logger.warning(f"Error cancelling resting TP order: {e}")
+
+        # 2. Execute Monitored Pegged Limit Sell (Zero Market Orders)
+        if self.mode == "live" and self.binance_adapter:
+            logger.warning(f"🚨 [MONITORED MAX HOLD LIQUIDATION] Executing chased limit sell for {bsym} Qty: {pos.quantity}...")
+            try:
+                res = self.binance_adapter.execute_monitored_limit_sell(
+                    symbol=bsym,
+                    quantity=pos.quantity,
+                    timeout_seconds=60.0,
+                    chase_interval=3.0
+                )
+                exit_price = float(res.get('avg_price', current_price))
+            except Exception as e:
+                logger.error(f"Error during monitored max hold liquidation on {bsym}: {e}")
+                exit_price = current_price
+        else:
+            exit_price = current_price
+
+        # 3. Calculate PnL and restore proceeds
+        net_ret_pct = ((exit_price - pos.entry_price) / pos.entry_price) * 100.0
+        dollar_pnl = pos.allocated_capital * (net_ret_pct / 100.0)
+        self.portfolio.free_cash += pos.allocated_capital + dollar_pnl
+
+        # 4. Record Trade History
+        trade_record = {
+            'symbol': symbol,
+            'binance_symbol': bsym,
+            'entry_price': pos.entry_price,
+            'exit_price': exit_price,
+            'quantity': pos.quantity,
+            'allocated_capital': pos.allocated_capital,
+            'dollar_pnl': dollar_pnl,
+            'net_ret_pct': net_ret_pct,
+            'exit_reason': "MAX_HOLD_TIMEOUT",
+            'bars_held': pos.bars_held,
+            'entry_time': pos.entry_timestamp,
+            'exit_time': str(datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S"))
+        }
+        self.portfolio.closed_trades.append(trade_record)
+        self.ledger.log_completed_trade(trade_record)
+
+        self.ledger.log_order_event(
+            event_type="OUTAGE_MAX_HOLD_LIQUIDATED",
+            symbol=symbol,
+            binance_symbol=bsym,
+            side="SELL",
+            order_type="LIMIT_MONITORED",
+            price=exit_price,
+            quantity=pos.quantity,
+            allocated_capital=pos.allocated_capital,
+            reason=f"Exceeded 12-hour max holding duration ({pos.bars_held} bars). Monitored limit exit at ${exit_price:,.2f}",
+            status="FILLED",
+            details={'dollar_pnl': dollar_pnl, 'net_ret_pct': net_ret_pct, 'bars_held': pos.bars_held}
+        )
+
+        # 5. Remove from active positions (freeing slot)
+        self.portfolio.active_positions.pop(symbol, None)
+        summary['liquidated_max_holds'].append(trade_record)
+        logger.warning(
+            f"⌛ Max Hold Exit for {symbol} @ ${exit_price:,.2f} | PnL: ${dollar_pnl:,.2f} ({net_ret_pct:+.2f}%) | "
+            f"Free Cash: ${self.portfolio.free_cash:,.2f} | Slot Freed."
+        )
 
     def _liquidate_outage_stop(
         self,
