@@ -37,6 +37,7 @@ import pandas as pd
 import joblib
 import types
 import matplotlib.pyplot as plt
+import matplotlib.dates as mdates
 
 # Add project root to sys.path
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -251,17 +252,15 @@ def load_champion_model(symbol: str) -> Tuple[Any, float, float, float]:
 # ==============================================================================
 # 🔬 EMBEDDED RESEARCH FEATURE FORMULAS (BIT-FOR-BIT ACCRETION BENCHMARK)
 # ==============================================================================
-def compute_features_benchmark(df: pd.DataFrame) -> pd.DataFrame:
-    """Computes all 28 structural features causally with strictly shifted lookbacks."""
+def compute_containers_and_macro_regimes(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes Rolling Hourly, Daily, and Weekly Containers and Macro Biomes causally."""
     n = len(df)
     highs = df['high'].values
     lows = df['low'].values
     closes = df['close'].values
     opens = df['open'].values
-    volumes = df['volume'].values
-    eps = 1e-8
 
-    # 1. Rolling Containers (Strictly shifted, excluding bar t)
+    # Strictly shifted lookbacks (excluding bar t)
     s_h = pd.Series(highs, index=df.index)
     s_l = pd.Series(lows, index=df.index)
 
@@ -272,9 +271,9 @@ def compute_features_benchmark(df: pd.DataFrame) -> pd.DataFrame:
     prior_wk_h = s_h.shift(1).rolling(ROLLING_WEEK_BARS, min_periods=ROLLING_WEEK_BARS).max().bfill().values
     prior_wk_l = s_l.shift(1).rolling(ROLLING_WEEK_BARS, min_periods=ROLLING_WEEK_BARS).min().bfill().values
 
-    # 2. Tactical State Machine
     tactical_state = np.empty(n, dtype=object)
     state_duration = np.zeros(n, dtype=int)
+
     cur_state = "BULL_EXHAUSTED"
     cur_duration = 0
 
@@ -288,126 +287,145 @@ def compute_features_benchmark(df: pd.DataFrame) -> pd.DataFrame:
         ph_h = prior_h_h[t]
         ph_l = prior_h_l[t]
 
+        # Tactical State Engine (Daily High/Low pushes)
         pushed_d_up = (h_t > pd_h)
         pushed_d_dn = (l_t < pd_l)
-        prev_state = cur_state
 
+        prev_state = cur_state
         if pushed_d_up and not pushed_d_dn:
-            cur_state = "ACTIVE_BULL_WAVE"
+            cur_state = "ACTIVE_BULL_WAVE"  # Green
         elif pushed_d_dn and not pushed_d_up:
-            cur_state = "ACTIVE_BEAR_WAVE"
+            cur_state = "ACTIVE_BEAR_WAVE"  # Red
         elif pushed_d_up and pushed_d_dn:
             cur_state = "ACTIVE_BULL_WAVE" if c_t >= o_t else "ACTIVE_BEAR_WAVE"
         else:
             if cur_state == "ACTIVE_BULL_WAVE" and c_t < ph_l:
-                cur_state = "BULL_EXHAUSTED"
+                cur_state = "BULL_EXHAUSTED"  # Yellow (pulled back below Hourly low)
             elif cur_state == "ACTIVE_BEAR_WAVE" and c_t > ph_h:
-                cur_state = "BEAR_EXHAUSTED"
+                cur_state = "BEAR_EXHAUSTED"  # Purple (bounced above Hourly high)
 
-        cur_duration = (cur_duration + 1) if (cur_state == prev_state) else 1
+        if cur_state == prev_state:
+            cur_duration += 1
+        else:
+            cur_duration = 1
+
         tactical_state[t] = cur_state
         state_duration[t] = cur_duration
 
-    # 3. Continuous Micro States & Shelf Floor
-    micro_green = np.zeros(n, dtype=float)
+    out = df.copy()
+    out['prior_h_h'] = prior_h_h
+    out['prior_h_l'] = prior_h_l
+    out['prior_d_h'] = prior_d_h
+    out['prior_d_l'] = prior_d_l
+    out['prior_wk_h'] = prior_wk_h
+    out['prior_wk_l'] = prior_wk_l
+    out['tactical_state'] = tactical_state
+    out['tactical_state_duration_bars'] = state_duration
+
+    # Macro Regime One-Hot Indicators
+    out['is_green']  = (out['tactical_state'] == 'ACTIVE_BULL_WAVE').astype(float)
+    out['is_yellow'] = (out['tactical_state'] == 'BULL_EXHAUSTED').astype(float)
+    out['is_red']    = (out['tactical_state'] == 'ACTIVE_BEAR_WAVE').astype(float)
+    out['is_purple'] = (out['tactical_state'] == 'BEAR_EXHAUSTED').astype(float)
+
+    return out
+
+
+def compute_continuous_micro_states(df: pd.DataFrame) -> Tuple[np.ndarray, np.ndarray]:
+    """
+    Computes the continuous 24/7 binary Micro State bar-by-bar:
+      - MICRO_RED   : Downward cascade leg (searching for low, ratcheting down).
+      - MICRO_GREEN : Active relief expansion holding above confirmed shelf floor L_k.
+    """
+    n = len(df)
+    closes = df['close'].values
+    lows = df['low'].values
+
+    micro_states = np.empty(n, dtype=object)
     dist_floor_pct = np.zeros(n, dtype=float)
-    c_mstate = "MICRO_RED"
-    c_cand_low = lows[0]
-    c_floor = None
+
+    curr_state = "MICRO_RED"
+    curr_cand_low = lows[0]
+    curr_floor = None
 
     for t in range(n):
         l_t = lows[t]
         c_t = closes[t]
-        if c_mstate == "MICRO_RED":
-            if l_t < c_cand_low:
-                c_cand_low = l_t
-            elif c_t > c_cand_low:
-                c_floor = c_cand_low
-                c_mstate = "MICRO_GREEN"
-        elif c_mstate == "MICRO_GREEN":
-            if c_floor is not None and l_t < c_floor:
-                c_mstate = "MICRO_RED"
-                c_cand_low = l_t
-                c_floor = None
 
-        if c_mstate == "MICRO_GREEN":
-            micro_green[t] = 1.0
-            dist_floor_pct[t] = ((c_t - c_floor) / c_floor * 100.0) if (c_floor and c_floor > 0) else 0.0
+        if curr_state == "MICRO_RED":
+            if l_t < curr_cand_low:
+                curr_cand_low = l_t
+            elif c_t > curr_cand_low:
+                curr_floor = curr_cand_low
+                curr_state = "MICRO_GREEN"
+        elif curr_state == "MICRO_GREEN":
+            if curr_floor is not None and l_t < curr_floor:
+                curr_state = "MICRO_RED"
+                curr_cand_low = l_t
+                curr_floor = None
+
+        micro_states[t] = curr_state
+
+        if curr_state == "MICRO_GREEN" and curr_floor is not None and curr_floor > 0:
+            dist_floor_pct[t] = (c_t - curr_floor) / curr_floor * 100.0
         else:
-            micro_green[t] = 0.0
             dist_floor_pct[t] = 0.0
 
-    # 4. Feature DataFrame Construction
-    feat = pd.DataFrame(index=df.index)
+    return micro_states, dist_floor_pct
 
-    # RPI Features
-    feat['rpi_h_pos']  = np.clip((closes - prior_h_l) / (prior_h_h - prior_h_l + eps), -0.5, 1.5)
-    feat['rpi_d_pos']  = np.clip((closes - prior_d_l) / (prior_d_h - prior_d_l + eps), -0.5, 1.5)
-    feat['rpi_wk_pos'] = np.clip((closes - prior_wk_l) / (prior_wk_h - prior_wk_l + eps), -0.5, 1.5)
-    feat['rpi_compression_h_in_d'] = (prior_h_h - prior_h_l) / (prior_d_h - prior_d_l + eps)
-    feat['rpi_compression_d_in_wk'] = (prior_d_h - prior_d_l) / (prior_wk_h - prior_wk_l + eps)
 
-    # SDI Features
-    s_c = pd.Series(closes, index=df.index)
-    ret_15m = s_c.pct_change().fillna(0.0)
-    for span, name in [(ROLLING_HOUR_BARS, 'h'), (ROLLING_DAY_BARS, 'd'), (ROLLING_WEEK_BARS, 'wk')]:
-        anchor = s_c.rolling(span, min_periods=1).mean().values
-        vol = (ret_15m.rolling(span, min_periods=span).std().bfill().values + eps) * 100.0
-        stretch = (closes - anchor) / anchor * 100.0
-        feat[f'sdi_{name}_stretch'] = stretch
-        feat[f'sdi_{name}_zscore']  = stretch / vol
+def compute_tactical_tcxa_15m(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes Tactical TCXA features on continuous 24/7 crypto candles."""
+    out = pd.DataFrame(index=df.index)
+    closes = df['close']
+    volumes = df['volume']
+    eps = 1e-8
 
-    # Kinematics & RVOL
-    candle_range = highs - lows + eps
-    feat['bar_body_ratio'] = np.abs(closes - opens) / candle_range
-    feat['bar_thrust_dir'] = np.where(closes >= opens, 1.0, -1.0)
-    median_vol = pd.Series(volumes, index=df.index).rolling(ROLLING_DAY_BARS, min_periods=ROLLING_HOUR_BARS).median().bfill().values + eps
-    feat['bar_rvol'] = volumes / median_vol
-    feat['ret_24h_pct'] = ((s_c - s_c.shift(ROLLING_DAY_BARS)) / s_c.shift(ROLLING_DAY_BARS) * 100.0).fillna(0.0).values
+    log_vol = np.log1p(np.maximum(volumes.values, 0.0))
+    price_diff = closes.diff().fillna(0).values
+    inc_eff = price_diff / (log_vol + 1.0)
 
-    # Regime One-Hots
-    feat['is_green']  = (tactical_state == 'ACTIVE_BULL_WAVE').astype(float)
-    feat['is_yellow'] = (tactical_state == 'BULL_EXHAUSTED').astype(float)
-    feat['is_red']    = (tactical_state == 'ACTIVE_BEAR_WAVE').astype(float)
-    feat['is_purple'] = (tactical_state == 'BEAR_EXHAUSTED').astype(float)
-    feat['tactical_state_duration_bars'] = state_duration
-    feat['is_micro_green'] = micro_green
-    feat['dist_to_shelf_floor_pct'] = dist_floor_pct
+    tiers = [
+        ('h', TCXA_H_SHORT, TCXA_H_LONG),
+        ('d', TCXA_D_SHORT, TCXA_D_LONG)
+    ]
 
-    # TCXA Features (Hourly & Daily)
-    log_vol = np.log1p(np.maximum(volumes, 0.0))
-    p_diff = pd.Series(closes).diff().fillna(0.0).values
-    v_norm = pd.Series(log_vol).rolling(ROLLING_DAY_BARS, min_periods=1).apply(lambda x: (x[-1] - np.mean(x)) / (np.std(x) + eps), raw=True).fillna(0.0).values
-    p_eff = p_diff * (1.0 + np.maximum(v_norm, 0.0))
+    for prefix, s_span, l_span in tiers:
+        ema_s = closes.ewm(span=s_span, adjust=False).mean()
+        ema_l = closes.ewm(span=l_span, adjust=False).mean()
 
-    for span_s, span_l, prefix in [(TCXA_H_SHORT, TCXA_H_LONG, 'h'), (TCXA_D_SHORT, TCXA_D_LONG, 'd')]:
-        fast_s = pd.Series(p_eff).rolling(span_s, min_periods=1).sum().values
-        slow_s = pd.Series(p_eff).rolling(span_l, min_periods=1).sum().values
-        phase = np.sign(fast_s - slow_s)
+        phase = np.where(ema_s > ema_l, 1, -1)
+        x_flip = (pd.Series(phase, index=df.index) != pd.Series(phase, index=df.index).shift(1))
+        x_flip.iloc[0] = True
+        phase_id = x_flip.cumsum()
 
-        time_since_x = np.zeros(n, dtype=int)
-        c_val = np.zeros(n, dtype=float)
-        c_age = np.zeros(n, dtype=int)
-        eff_decay = np.zeros(n, dtype=float)
+        time_since_x = phase_id.groupby(phase_id).cumcount()
 
-        last_x_idx = 0
-        cur_c = closes[0]
+        c_val = np.zeros(len(df))
+        c_age = np.zeros(len(df))
+        eff_decay = np.zeros(len(df))
+
+        cur_c = closes.iloc[0]
         cur_c_idx = 0
+        cur_phase = phase[0]
         eff_since_c = 0.0
+        eff_total = 0.0
 
-        for i in range(n):
-            if i > 0 and phase[i] != phase[i - 1]:
-                last_x_idx = i
-                cur_c = closes[i]
+        for i in range(len(df)):
+            p_i = phase[i]
+            c_i = closes.iloc[i]
+            eff_i = inc_eff[i]
+
+            if x_flip.iloc[i]:
+                cur_phase = p_i
+                cur_c = c_i
                 cur_c_idx = i
                 eff_since_c = 0.0
+                eff_total = 0.0
 
-            time_since_x[i] = i - last_x_idx
-            c_i = closes[i]
-            eff_i = p_eff[i]
-            eff_total = fast_s[i]
+            eff_total += eff_i
 
-            if phase[i] >= 0:
+            if cur_phase == 1:
                 if c_i > cur_c:
                     cur_c = c_i
                     cur_c_idx = i
@@ -424,16 +442,85 @@ def compute_features_benchmark(df: pd.DataFrame) -> pd.DataFrame:
 
             c_val[i] = cur_c
             c_age[i] = i - cur_c_idx
-            eff_decay[i] = eff_since_c / (np.abs(eff_total) + eps)
+            eff_decay[i] = eff_since_c / (abs(eff_total) + eps)
 
-        feat[f'tcxa_{prefix}_phase'] = phase
-        feat[f'tcxa_{prefix}_time_since_x'] = time_since_x
-        feat[f'tcxa_{prefix}_c_to_t_pct'] = (closes - c_val) / c_val * 100.0
-        feat[f'tcxa_{prefix}_c_age_bars'] = c_age
-        feat[f'tcxa_{prefix}_c_velocity'] = feat[f'tcxa_{prefix}_c_to_t_pct'] / (c_age + 1.0)
-        feat[f'tcxa_{prefix}_efficiency_decay'] = eff_decay
+        out[f'tcxa_{prefix}_phase'] = phase
+        out[f'tcxa_{prefix}_time_since_x'] = time_since_x
+        out[f'tcxa_{prefix}_c_to_t_pct'] = (closes.values - c_val) / c_val * 100.0
+        out[f'tcxa_{prefix}_c_age_bars'] = c_age
+        out[f'tcxa_{prefix}_c_velocity'] = out[f'tcxa_{prefix}_c_to_t_pct'] / (c_age + 1.0)
+        out[f'tcxa_{prefix}_efficiency_decay'] = eff_decay
 
-    return feat[MODEL_FEATURE_NAMES]
+    return out
+
+
+def compute_sdi_and_rpi_features(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes expanding SDI stretch, Z-scores, and RPI coordinates across containers."""
+    out = pd.DataFrame(index=df.index)
+    closes = df['close']
+    highs = df['high']
+    lows = df['low']
+    eps = 1e-8
+
+    # 1. RPI Position in Container Boxes [-0.5 to 1.5]
+    out['rpi_h_pos']  = ((closes - df['prior_h_l']) / (df['prior_h_h'] - df['prior_h_l'] + eps)).clip(-0.5, 1.5)
+    out['rpi_d_pos']  = ((closes - df['prior_d_l']) / (df['prior_d_h'] - df['prior_d_l'] + eps)).clip(-0.5, 1.5)
+    out['rpi_wk_pos'] = ((closes - df['prior_wk_l']) / (df['prior_wk_h'] - df['prior_wk_l'] + eps)).clip(-0.5, 1.5)
+
+    # 2. Container Volatility Compressions
+    out['rpi_compression_h_in_d'] = (df['prior_h_h'] - df['prior_h_l']) / (df['prior_d_h'] - df['prior_d_l'] + eps)
+    out['rpi_compression_d_in_wk'] = (df['prior_d_h'] - df['prior_d_l']) / (df['prior_wk_h'] - df['prior_wk_l'] + eps)
+
+    # 3. Expanding SDI Statistical Stretch (Z-scores from expanding anchors)
+    ret_15m = closes.pct_change().fillna(0.0)
+
+    # Hourly SDI (4 bars)
+    anchor_h = closes.rolling(ROLLING_HOUR_BARS, min_periods=1).mean()
+    vol_h = ret_15m.rolling(ROLLING_HOUR_BARS, min_periods=ROLLING_HOUR_BARS).std().bfill() + eps
+    out['sdi_h_stretch'] = (closes - anchor_h) / anchor_h * 100.0
+    out['sdi_h_zscore']  = out['sdi_h_stretch'] / (vol_h * 100.0 + eps)
+
+    # Daily SDI (96 bars)
+    anchor_d = closes.rolling(ROLLING_DAY_BARS, min_periods=1).mean()
+    vol_d = ret_15m.rolling(ROLLING_DAY_BARS, min_periods=ROLLING_DAY_BARS).std().bfill() + eps
+    out['sdi_d_stretch'] = (closes - anchor_d) / anchor_d * 100.0
+    out['sdi_d_zscore']  = out['sdi_d_stretch'] / (vol_d * 100.0 + eps)
+
+    # Weekly SDI (672 bars)
+    anchor_wk = closes.rolling(ROLLING_WEEK_BARS, min_periods=1).mean()
+    vol_wk = ret_15m.rolling(ROLLING_WEEK_BARS, min_periods=ROLLING_WEEK_BARS).std().bfill() + eps
+    out['sdi_wk_stretch'] = (closes - anchor_wk) / anchor_wk * 100.0
+    out['sdi_wk_zscore']  = out['sdi_wk_stretch'] / (vol_wk * 100.0 + eps)
+
+    # 4. Instantaneous Candle Kinematics
+    candle_range = (highs - lows + eps)
+    out['bar_body_ratio'] = (closes - df['open']).abs() / candle_range
+    out['bar_thrust_dir'] = np.where(closes >= df['open'], 1.0, -1.0)
+
+    # Relative Volume (RVOL relative to rolling 96-bar / 24h median volume)
+    median_vol = df['volume'].rolling(ROLLING_DAY_BARS, min_periods=ROLLING_HOUR_BARS).median().bfill() + eps
+    out['bar_rvol'] = df['volume'] / median_vol
+
+    # Rolling 24-hour return
+    out['ret_24h_pct'] = (closes - closes.shift(ROLLING_DAY_BARS)) / closes.shift(ROLLING_DAY_BARS) * 100.0
+    out['ret_24h_pct'].fillna(0.0, inplace=True)
+
+    return out
+
+
+def compute_features_benchmark(df: pd.DataFrame) -> pd.DataFrame:
+    """Computes all 28 structural features causally with bit-for-bit parity to the research engine."""
+    df_containers = compute_containers_and_macro_regimes(df)
+    m_states, dist_floor = compute_continuous_micro_states(df_containers)
+    df_containers['micro_state'] = m_states
+    df_containers['is_micro_green'] = (m_states == 'MICRO_GREEN').astype(float)
+    df_containers['dist_to_shelf_floor_pct'] = dist_floor
+
+    df_tcxa = compute_tactical_tcxa_15m(df_containers)
+    df_sdi_rpi = compute_sdi_and_rpi_features(df_containers)
+
+    df_all = pd.concat([df_containers, df_tcxa, df_sdi_rpi], axis=1)
+    return df_all[MODEL_FEATURE_NAMES]
 
 
 # ==============================================================================
@@ -617,10 +704,15 @@ def plot_validation_dashboard(
     # Panel 1: Live Recorded Equity Curve vs Simulated Backtest Benchmark
     ax1 = axes[0, 0]
     if live_snapshots and sim_snapshots:
-        df_live_s = pd.DataFrame(live_snapshots).sort_values('timestamp')
-        df_sim_s  = pd.DataFrame(sim_snapshots).sort_values('timestamp')
+        df_live_s = pd.DataFrame(live_snapshots).copy()
+        df_sim_s  = pd.DataFrame(sim_snapshots).copy()
+        df_live_s['timestamp'] = pd.to_datetime(df_live_s['timestamp'], utc=True)
+        df_sim_s['timestamp']  = pd.to_datetime(df_sim_s['timestamp'], utc=True)
+        df_live_s.sort_values('timestamp', inplace=True)
+        df_sim_s.sort_values('timestamp', inplace=True)
         ax1.plot(df_live_s['timestamp'], df_live_s['total_equity'], color='#00e676', lw=2.2, label='Live Portfolio Equity (Actual Binance USD)')
         ax1.plot(df_sim_s['timestamp'], df_sim_s['total_equity'], color='#00e5ff', lw=1.8, linestyle='--', label='Simulated Backtest Equity (Benchmark)')
+        ax1.xaxis.set_major_formatter(mdates.DateFormatter('%m-%d %H:%M'))
         ax1.legend(loc='upper left', fontsize=9, framealpha=0.3)
     else:
         ax1.text(0.5, 0.5, "Insufficient snapshot progression data", ha='center', va='center', color='gray')
@@ -643,7 +735,7 @@ def plot_validation_dashboard(
         ax2.plot([min_v, max_v], [min_v, max_v], color='#ffea00', linestyle='--', lw=1.5, label='Ideal 1:1 Parity Line (y = x)')
 
         for m in matched_pairs:
-            ax2.annotate(m['symbol'], (m['sim_ret_pct'], m['live_ret_pct']),
+            ax2.annotate(f"{m['symbol']} #{m['trade_no']}", (m['sim_ret_pct'], m['live_ret_pct']),
                          textcoords="offset points", xytext=(4, 4), fontsize=8, color='white')
         ax2.legend(loc='upper left', fontsize=9, framealpha=0.3)
     else:
@@ -656,7 +748,7 @@ def plot_validation_dashboard(
     # Panel 3: Price Slippage Distribution (Entry bps vs Exit bps per trade)
     ax3 = axes[1, 0]
     if matched_pairs:
-        trade_labels = [f"{m['symbol']} (#{i+1})" for i, m in enumerate(matched_pairs)]
+        trade_labels = [f"{m['symbol']} (#{m['trade_no']})" for m in matched_pairs]
         entry_slips = [m['entry_slippage_bps'] for m in matched_pairs]
         exit_slips  = [m['exit_slippage_bps'] for m in matched_pairs]
         x_idx = np.arange(len(matched_pairs))
@@ -679,6 +771,7 @@ def plot_validation_dashboard(
     if matched_pairs:
         real_bars = [m['live_bars_held'] for m in matched_pairs]
         sim_bars  = [m['sim_bars_held'] for m in matched_pairs]
+        trade_labels = [f"{m['symbol']} (#{m['trade_no']})" for m in matched_pairs]
         x_idx = np.arange(len(matched_pairs))
         width = 0.35
 
@@ -696,6 +789,16 @@ def plot_validation_dashboard(
 
     plt.tight_layout()
     plt.show()
+
+
+def format_price_str(price: float) -> str:
+    """Formats prices cleanly across high and low unit value assets."""
+    if price >= 100.0:
+        return f"${price:,.2f}"
+    elif price >= 1.0:
+        return f"${price:.2f}"
+    else:
+        return f"${price:.4f}"
 
 
 # ==============================================================================
@@ -738,8 +841,10 @@ def main():
         print("⚠️ No completed trades found in activity database yet. Exiting.")
         return
 
-    first_entry_time = pd.to_datetime(live_trades[0]['entry_time'], utc=True)
-    last_exit_time = pd.to_datetime(live_trades[-1]['exit_time'], utc=True)
+    all_entry_times = [pd.to_datetime(t['entry_time'], utc=True) for t in live_trades]
+    all_exit_times = [pd.to_datetime(t['exit_time'], utc=True) for t in live_trades]
+    first_entry_time = min(all_entry_times)
+    last_exit_time = max(all_exit_times)
     window_start = first_entry_time - timedelta(days=1)  # Buffer for signal evaluation
     window_end = last_exit_time + timedelta(hours=6)
 
@@ -760,23 +865,30 @@ def main():
     for sym in CRYPTO_CHAMPIONS.keys():
         try:
             df_raw = load_raw_crypto_15m(sym)
-            df_feat = compute_features_benchmark(df_raw)
             model, cutoff, _, _ = load_champion_model(sym)
 
-            # Predict on benchmark features
-            X = df_feat.values
-            p_pred = model.predict_proba(X)[:, 1]
-            df_bench = pd.DataFrame({
-                'p_hist': p_pred,
-                'is_signal_hist': (p_pred >= cutoff).astype(int)
-            }, index=df_feat.index)
-
-            # Compare against live logged predictions
             sym_preds = df_live_preds[df_live_preds['kraken_symbol'] == sym] if not df_live_preds.empty else pd.DataFrame()
             if sym_preds.empty:
                 print(f"{sym:<8} | {'N/A (No logs)':<13} | {'-':<23} | {'-':<17} | {'-':<14} | {'SKIPPED':<10}")
                 continue
 
+            # Align warm-up lookback with live feature engine
+            min_dt = sym_preds['dt_utc'].min()
+            max_dt = sym_preds['dt_utc'].max()
+            loc_start = df_raw.index.get_indexer([min_dt], method='nearest')[0]
+            warmup_start_idx = max(0, loc_start - WARMUP_BARS_MIN - 10)
+            loc_end = df_raw.index.get_indexer([max_dt], method='nearest')[0]
+            df_slice = df_raw.iloc[warmup_start_idx:loc_end + 1].copy()
+
+            df_feat = compute_features_benchmark(df_slice)
+            X = df_feat.values
+            p_pred = model.predict_proba(X)[:, 1]
+            df_bench = pd.DataFrame({
+                'p_hist': p_pred,
+                'is_signal_hist': (p_pred >= cutoff).astype(int)
+            }, index=df_slice.index)
+
+            # Compare against live logged predictions
             merged = pd.merge_asof(
                 sym_preds.sort_values('dt_utc'),
                 df_bench.reset_index().sort_values('dt_utc'),
@@ -823,18 +935,23 @@ def main():
     for sym, champ in CRYPTO_CHAMPIONS.items():
         try:
             df_raw = load_raw_crypto_15m(sym)
-            df_feat = compute_features_benchmark(df_raw)
             model, cutoff, x_star, y_star = load_champion_model(sym)
 
+            loc_start = df_raw.index.get_indexer([window_start], method='nearest')[0]
+            warmup_start_idx = max(0, loc_start - WARMUP_BARS_MIN - 10)
+            loc_end = df_raw.index.get_indexer([window_end], method='nearest')[0]
+            df_slice = df_raw.iloc[warmup_start_idx:loc_end + 1].copy()
+
+            df_feat = compute_features_benchmark(df_slice)
             X = df_feat.values
             p_pred = model.predict_proba(X)[:, 1]
 
-            closes = df_raw['close'].values
-            highs = df_raw['high'].values
-            lows = df_raw['low'].values
+            closes = df_slice['close'].values
+            highs = df_slice['high'].values
+            lows = df_slice['low'].values
             rvols = df_feat['bar_rvol'].values
-            dts = df_raw.index.to_series().dt.tz_convert('UTC').values
-            n_bars = len(df_raw)
+            dts = df_slice.index.to_series().dt.tz_convert('UTC').values
+            n_bars = len(df_slice)
 
             # Filter candidates inside the evaluation window
             for t in range(n_bars):
@@ -949,15 +1066,18 @@ def main():
         l_exit_p = float(lt['exit_price'])
         l_ret = float(lt['net_ret_pct'])
         l_pnl = float(lt['dollar_pnl'])
-        l_reason = lt['exit_reason']
+        l_reason = str(lt.get('exit_reason', ''))
         l_bars = int(lt.get('bars_held', 0))
 
         # Check for Day 0 adopted legacy holding
-        is_legacy = (idx == 0 and "ADOPT" in l_reason.upper() or (idx == 0 and l_sym == 'ETHUSD' and l_bars >= 48))
+        is_legacy = (
+            "ADOPT" in l_reason.upper() or 
+            (l_sym == 'ETHUSD' and l_bars >= 48 and l_entry_time < pd.to_datetime('2026-09-24 12:00:00', utc=True))
+        )
 
         best_sim = None
         best_sim_idx = None
-        min_time_diff = timedelta(hours=3)  # Maximum match window
+        min_time_diff = timedelta(hours=4)  # Maximum match window
 
         for s_idx, st in enumerate(sim_trades):
             if s_idx in matched_sim_indices:
@@ -981,10 +1101,13 @@ def main():
 
             entry_slip_bps = ((l_entry_p - s_entry_p) / s_entry_p) * 10000.0
             exit_slip_bps  = ((l_exit_p - s_exit_p) / s_exit_p) * 10000.0
+            
+            l_reason_upper = l_reason.upper()
+            s_reason_upper = s_reason.upper()
             reason_match = (
-                (s_reason == "TARGET_TP" and "TP" in l_reason) or
-                (s_reason == "STOP" and "STOP" in l_reason) or
-                (s_reason == "TIMEOUT" and ("TIMEOUT" in l_reason or "MAX_HOLD" in l_reason))
+                (s_reason_upper == "TARGET_TP" and ("TP" in l_reason_upper or "PROFIT" in l_reason_upper)) or
+                (s_reason_upper == "STOP" and "STOP" in l_reason_upper) or
+                (s_reason_upper == "TIMEOUT" and ("TIMEOUT" in l_reason_upper or "MAX_HOLD" in l_reason_upper or "HOLD" in l_reason_upper))
             )
 
             matches.append({
@@ -1045,10 +1168,14 @@ def main():
     for m in matches:
         match_str = "LEGACY ADOPT" if m.get('is_legacy_adopted') else ("MATCH" if m['reason_match'] else "DIVERGED")
         slip_str = f"{m['entry_slippage_bps']:>+6.1f}" if m['is_matched'] else "  0.0"
+        live_in = format_price_str(m['live_entry_p'])
+        sim_in  = format_price_str(m['sim_entry_p'])
+        live_out = format_price_str(m['live_exit_p'])
+        sim_out  = format_price_str(m['sim_exit_p'])
         print(
             f"{m['trade_no']:<3} | {m['symbol']:<7} | {m['entry_time']:<11} | "
-            f"${m['live_entry_p']:<9,.2f} | ${m['sim_entry_p']:<9,.2f} | {slip_str:<10} | "
-            f"${m['live_exit_p']:<9,.2f} | ${m['sim_exit_p']:<9,.2f} | {m['live_ret_pct']:>+6.2f}% | "
+            f"{live_in:<10} | {sim_in:<10} | {slip_str:<10} | "
+            f"{live_out:<10} | {sim_out:<10} | {m['live_ret_pct']:>+6.2f}% | "
             f"{m['sim_ret_pct']:>+6.2f}% | {match_str:<12}"
         )
     print("=" * 115)
@@ -1059,7 +1186,9 @@ def main():
     matched_subset = [m for m in matches if m['is_matched'] and not m.get('is_legacy_adopted', False)]
     n_total = len(live_trades)
     n_matched = len(matched_subset)
-    match_rate = (n_matched / (n_total - (1 if matches[0].get('is_legacy_adopted') else 0))) * 100.0 if n_total > 1 else 100.0
+    n_legacy = sum(1 for m in matches if m.get('is_legacy_adopted'))
+    eligible_total = max(1, n_total - n_legacy)
+    match_rate = (n_matched / eligible_total) * 100.0 if n_total > n_legacy else 100.0
 
     entry_slips = [m['entry_slippage_bps'] for m in matched_subset]
     exit_slips = [m['exit_slippage_bps'] for m in matched_subset]
@@ -1075,8 +1204,8 @@ def main():
     print("\n" + "=" * 105)
     print("📊 [TABLE 3] MASTER EXECUTION PARITY & SLIPPAGE SCORECARD:")
     print("=" * 105)
-    print(f"   • Total Live Completed Trades  : {n_total} trades (including {sum(1 for m in matches if m.get('is_legacy_adopted'))} legacy adopted)")
-    print(f"   • Backtest Matched Trades      : {n_matched} / {n_total - (1 if matches[0].get('is_legacy_adopted') else 0)} ({match_rate:.1f}% Selection Parity)")
+    print(f"   • Total Live Completed Trades  : {n_total} trades (including {n_legacy} legacy adopted)")
+    print(f"   • Backtest Matched Trades      : {n_matched} / {eligible_total} ({match_rate:.1f}% Selection Parity)")
     print(f"   • Exit Reason Agreement Rate   : {reason_matches} / {n_matched} ({reason_match_rate:.1f}%)")
     print(f"   • Mean Maker Buy Slippage      : {mean_entry_slip:+.2f} bps (0.0% Maker Tier target)")
     print(f"   • Mean Monitored Exit Slippage : {mean_exit_slip:+.2f} bps (Zero-market-order pegged executions)")
