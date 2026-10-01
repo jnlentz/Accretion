@@ -8,8 +8,8 @@
 
 📥 Live Telemetry Database Ingestion:
    • Completed Trades Recorded: 15
-   • Portfolio Snapshots       : 777
-   • Logged 15m Predictions   : 4,516
+   • Portfolio Snapshots       : 778
+   • Logged 15m Predictions   : 4,522
 
 =========================================================================================================
 🔬 [STAGE 1] MULTI-ASSET PREDICTION PARITY & MODEL INFERENCE AUDIT...
@@ -17,22 +17,22 @@
 PART A: BIT-FOR-BIT MODEL INFERENCE AUDIT (Live Telemetry Features vs Champion GBDT Models)
 Coin     | Audited Bars  | Max |P_live - P_model|  | Correlation (r)   | Signal Match   | Status    
 ---------------------------------------------------------------------------------------------------------
-XBTUSD   | 752 bars      | 0.00000000              | 1.0000            | 100.0%         | VERIFIED  
-ETHUSD   | 752 bars      | 0.00000000              | 1.0000            |  99.2%         | VERIFIED  
-SOLUSD   | 753 bars      | 0.00000000              | 1.0000            |  94.2%         | VERIFIED  
-ADAUSD   | 753 bars      | 0.00000000              | 1.0000            | 100.0%         | VERIFIED  
-XRPUSD   | 753 bars      | 0.00000000              | 1.0000            |  97.5%         | VERIFIED  
-XDGUSD   | 753 bars      | 0.00000000              | 1.0000            | 100.0%         | VERIFIED  
+XBTUSD   | 753 bars      | 0.00000000              | 1.0000            | 100.0%         | VERIFIED  
+ETHUSD   | 753 bars      | 0.00000000              | 1.0000            |  99.2%         | VERIFIED  
+SOLUSD   | 754 bars      | 0.00000000              | 1.0000            |  94.2%         | VERIFIED  
+ADAUSD   | 754 bars      | 0.00000000              | 1.0000            | 100.0%         | VERIFIED  
+XRPUSD   | 754 bars      | 0.00000000              | 1.0000            |  97.5%         | VERIFIED  
+XDGUSD   | 754 bars      | 0.00000000              | 1.0000            | 100.0%         | VERIFIED  
 ---------------------------------------------------------------------------------------------------------
 PART B: HISTORICAL STREAMING BUFFER RECONSTRUCTION AUDIT (Raw Kraken Candles vs Live Logs)
 Coin     | Audited Bars  | Max |P_live - P_hist|   | Correlation (r)   | Signal Match   | Status    
 ---------------------------------------------------------------------------------------------------------
-XBTUSD   | 752 bars      | 0.010487                | 0.9946            | 100.0%         | EXPLAINED 
-ETHUSD   | 752 bars      | 0.121318                | 0.9951            |  98.8%         | EXPLAINED 
-SOLUSD   | 753 bars      | 0.307098                | 0.7353            |  86.7%         | EXPLAINED 
-ADAUSD   | 753 bars      | 0.106757                | 0.9473            |  99.9%         | EXPLAINED 
-XRPUSD   | 753 bars      | 0.089802                | 0.9894            |  96.0%         | EXPLAINED 
-XDGUSD   | 753 bars      | 0.064201                | 0.9725            | 100.0%         | EXPLAINED 
+XBTUSD   | 753 bars      | 0.010487                | 0.9946            | 100.0%         | EXPLAINED 
+ETHUSD   | 753 bars      | 0.121318                | 0.9951            |  98.8%         | EXPLAINED 
+SOLUSD   | 754 bars      | 0.307098                | 0.7355            |  86.7%         | EXPLAINED 
+ADAUSD   | 754 bars      | 0.106757                | 0.9473            |  99.9%         | EXPLAINED 
+XRPUSD   | 754 bars      | 0.089802                | 0.9894            |  96.0%         | EXPLAINED 
+XDGUSD   | 754 bars      | 0.064201                | 0.9726            | 100.0%         | EXPLAINED 
 =========================================================================================================
 ℹ️ STAGE 1 AUDIT NOTE: Part A confirms 100% bit-for-bit inference parity (R²=1.0000) on logged features.
    In Part B, SOLUSD variance stems from Daily TCXA EMA (span 48/96) phase flipping on tight consolidation.
@@ -41,7 +41,7 @@ XDGUSD   | 753 bars      | 0.064201                | 0.9725            | 100.0% 
 ⏳ [STAGE 2] SIMULATING DETERMINISTIC WINDOW BACKTEST (POLICY 4 RVOL SURGE)...
    Window: 2026-09-23 21:15 to 2026-10-02 01:15 UTC
 =========================================================================================================
-⚡ Generated 521 candidate setups firing across the 7.0-day window.
+⚡ Generated 522 candidate setups firing across the 7.0-day window.
 ✅ Simulation complete: Backtest produced 16 simulated trades under Policy 4 RVOL Surge.
 
 =========================================================================================================
@@ -86,10 +86,8 @@ XDGUSD   | 753 bars      | 0.064201                | 0.9725            | 100.0% 
    • Compounded Portfolio Return (Real):  -3.65% (Compounded across 50% slots)
    • Compounded Portfolio Return (Sim) :  -3.59% (Compounded across 50% slots)
    ---------------------------------------------------------------------------
-   • Capital Normalization Base       : $10,000.00 USD (Aligned to actual live equity)
+   • Capital Normalization Base       : $76.11 USD (Aligned to actual live equity)
    • Total Realized Live Dollar PnL   : $-2.49
-   • Scaled Simulated Backtest PnL    : $-357.59
-   • Net Dollar Parity Delta          : $355.09
+   • Scaled Simulated Backtest PnL    : $-2.43
+   • Net Dollar Parity Delta          : $-0.06
 =========================================================================================================
-
-ℹ️ VERDICT: Execution parity audit complete. Inspect individual trade rows for queue or fill deviations.
