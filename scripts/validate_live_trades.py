@@ -1125,12 +1125,12 @@ def main():
                 'bars_held': l_bars
             })
 
-    # Determine initial capital from live portfolio snapshots or live trade allocation (Scale: ~$77 USD)
-    live_mode_snaps = [s for s in live_snapshots if s.get('mode', '').upper() == 'LIVE']
+    # Determine initial capital from genuine live account snapshots (< $1,000) or live trade allocation (Scale: ~$77 USD)
+    live_mode_snaps = [s for s in live_snapshots if s.get('mode', '').upper() == 'LIVE' and float(s.get('total_equity', 0.0)) < 1000.0]
     if live_mode_snaps:
         init_cap = float(live_mode_snaps[0]['total_equity'])
-    elif live_trades and 'allocated_capital' in live_trades[0] and float(live_trades[0]['allocated_capital']) > 0:
-        init_cap = float(live_trades[0]['allocated_capital']) / POSITION_SIZE_FRACTION
+    elif live_trades and 'allocated_capital' in live_trades[-1] and float(live_trades[-1]['allocated_capital']) > 0:
+        init_cap = float(live_trades[-1]['allocated_capital']) / POSITION_SIZE_FRACTION
     else:
         init_cap = 77.0
 
