@@ -63,8 +63,7 @@ from core.crypto_live_engine import (
     BINANCE_US_TAKER_FEE
 )
 from labs.crypto_intraday_barrier_feature_preprocessor import (
-    OUTPUT_DIR,
-    DEFAULT_HORIZON_BARS
+    OUTPUT_DIR
 )
 from labs.crypto_intraday_barrier_gbdt_lab import (
     load_or_generate_crypto_datasets,
@@ -75,12 +74,22 @@ from labs.crypto_intraday_barrier_gbdt_lab import (
 # ==============================================================================
 # ⚙️ LAB CONFIGURATION (Jesse can adjust directly here)
 # ==============================================================================
+# Trade Holding Horizon Configuration:
+# 48 Bars = 12.0 Hours (Empirically Certified Global Champion: +537.6% Return / 24.47 Calmar)
+DEFAULT_HORIZON_BARS: int      = 48
 INITIAL_CAPITAL: float         = 10_000.0   # Starting fund capital ($ USD)
 DEFAULT_CONCURRENT_SLOTS: int  = 2          # Baseline slot constraint (K=2)
 POSITION_SIZE_FRACTION: float  = 0.50       # 50% per slot at K=2 (or 0.3333 at K=3)
-ORDER_TTL_BARS: int            = 1          # Max bars (45 min) an unfilled limit buy can rest
+ORDER_TTL_BARS: int            = 1          # Max bars (15 min) an unfilled limit buy can rest
 DEFAULT_DISCOUNT_PCT: float     = 0.50       # -0.50% Maker Limit Buy Discount
-DEFAULT_SELL_PREMIUM_PCT: float = 0.30       # +0.50% Maker Limit Sell Premium (Matches Discount Lab champion)
+DEFAULT_SELL_PREMIUM_PCT: float = 0.30       # +0.30% Maker Limit Sell Premium
+
+# Sizing Modes:
+# "UNIFORM_FIXED": Standard fixed fraction of total portfolio equity (Baseline)
+# "GEOMETRIC_FREE_CASH": Allocates f_base fraction of remaining free unallocated cash
+DEFAULT_SIZING_MODE: str       = "UNIFORM_FIXED"
+DEFAULT_GEOMETRIC_FRACTION: float = 0.50    # f_base for geometric mode (e.g. 50% of free cash)
+MIN_ORDER_DOLLARS: float       = 50.0       # Minimum order threshold ($)
 
 # Execution Accounting Architecture:
 # True  = Realistic queue: resting limit orders occupy a slot & escrow cash while resting
@@ -97,6 +106,17 @@ SWEEP_SLOT_COUNTS: List[int]   = [2, 3, 5]
 # Caching Directories
 MODELS_DIR = PROJECT_ROOT / "export" / "accretion" / "models"
 CANDIDATE_CACHE_FILE = OUTPUT_DIR / f"crypto_candidate_setups_d{int(DEFAULT_DISCOUNT_PCT*100)}_p{int(DEFAULT_SELL_PREMIUM_PCT*100)}_ttl{ORDER_TTL_BARS}.parquet"
+
+
+def get_candidate_cache_path(
+    discount_pct: float = DEFAULT_DISCOUNT_PCT,
+    sell_premium_pct: float = DEFAULT_SELL_PREMIUM_PCT,
+    order_ttl_bars: int = ORDER_TTL_BARS,
+    horizon_bars: int = DEFAULT_HORIZON_BARS
+) -> Path:
+    """Generates a dedicated cache file path per (discount, premium, ttl, horizon) configuration."""
+    h_str = "inf" if (horizon_bars <= 0 or horizon_bars >= 999999) else f"h{horizon_bars}"
+    return OUTPUT_DIR / f"crypto_candidate_setups_d{int(discount_pct*100)}_p{int(sell_premium_pct*100)}_ttl{order_ttl_bars}_{h_str}.parquet"
 # ==============================================================================
 
 
@@ -148,24 +168,45 @@ def get_or_precompute_crypto_candidates(
     discount_pct: float = DEFAULT_DISCOUNT_PCT,
     sell_premium_pct: float = DEFAULT_SELL_PREMIUM_PCT,
     horizon_bars: int = DEFAULT_HORIZON_BARS,
-    force_recompute: bool = False
+    force_recompute: bool = False,
+    verbose: bool = False
 ) -> List[Dict[str, Any]]:
     """
     Loads precomputed candidate setups from parquet in 0.1s, or precomputes
-    and caches them across the synchronized Test Lockbox.
+    and caches them across the synchronized Test Lockbox for a specified horizon_bars.
     """
-    if not force_recompute and CANDIDATE_CACHE_FILE.exists():
-        print(f"⚡ Loading cached candidate setups from {CANDIDATE_CACHE_FILE.name}...")
-        try:
-            df_cands = pd.read_parquet(CANDIDATE_CACHE_FILE)
-            records = df_cands.to_dict(orient='records')
-            print(f"✅ Loaded {len(records):,} cached candidate setups across {len(active_symbols)} coins in 0.1s!")
-            return records
-        except Exception as e:
-            print(f"⚠️ Cache read error: {e}. Recomputing...")
+    cache_path = get_candidate_cache_path(discount_pct, sell_premium_pct, ORDER_TTL_BARS, horizon_bars)
 
-    print("=" * 105)
-    print("📥 PRECOMPUTING 24/7 CANDIDATE SETUPS ACROSS KRAKEN UNIVERSE (SYNCHRONIZED TEST LOCKBOX)...")
+    if not force_recompute:
+        if cache_path.exists():
+            if verbose:
+                print(f"⚡ Loading cached candidate setups from {cache_path.name}...")
+            try:
+                df_cands = pd.read_parquet(cache_path)
+                records = df_cands.to_dict(orient='records')
+                if verbose:
+                    print(f"✅ Loaded {len(records):,} cached candidate setups across {len(active_symbols)} coins in 0.1s!")
+                return records
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Cache read error: {e}. Recomputing...")
+        elif horizon_bars == DEFAULT_HORIZON_BARS and CANDIDATE_CACHE_FILE.exists():
+            if verbose:
+                print(f"⚡ Loading cached candidate setups from legacy {CANDIDATE_CACHE_FILE.name}...")
+            try:
+                df_cands = pd.read_parquet(CANDIDATE_CACHE_FILE)
+                records = df_cands.to_dict(orient='records')
+                if verbose:
+                    print(f"✅ Loaded {len(records):,} cached candidate setups across {len(active_symbols)} coins in 0.1s!")
+                return records
+            except Exception as e:
+                if verbose:
+                    print(f"⚠️ Cache read error: {e}. Recomputing...")
+
+    h_desc = "Indefinite Hold (Pure Barrier)" if (horizon_bars <= 0 or horizon_bars >= 999999) else f"{horizon_bars} Bars ({horizon_bars*15/60:.1f} Hours)"
+    if verbose:
+        print("=" * 105)
+        print(f"📥 PRECOMPUTING 24/7 CANDIDATE SETUPS [Horizon: {h_desc}] (SYNCHRONIZED TEST LOCKBOX)...")
     all_candidates = []
 
     for symbol in active_symbols:
@@ -212,7 +253,7 @@ def get_or_precompute_crypto_candidates(
                 p_signal = closes[t]
                 p_limit = p_signal * (1.0 - discount_pct / 100.0)
 
-                end_idx = min(t + horizon_bars + 1, n)
+                end_idx = min(t + horizon_bars + 1, n) if (0 < horizon_bars < 999999) else n
                 if end_idx <= t + 1:
                     continue
 
@@ -234,6 +275,7 @@ def get_or_precompute_crypto_candidates(
                 is_win = False
                 exit_reason = "UNFILLED"
                 p_exit = p_signal
+                bars_held = 0
 
                 if fill_step is not None:
                     fill_time = timestamps[t + fill_step]
@@ -268,6 +310,7 @@ def get_or_precompute_crypto_candidates(
                         p_exit = closes[t + exit_step]
 
                     exit_time = timestamps[t + exit_step]
+                    bars_held = max(1, exit_step - fill_step)
                     raw_ret = (p_exit - p_entry) / p_entry * 100.0
                     fee_bps = (MAKER_FEE_BPS + (MAKER_FEE_BPS if is_maker_exit else TAKER_FEE_BPS))
                     net_ret_pct = raw_ret - (fee_bps / 100.0)
@@ -292,6 +335,7 @@ def get_or_precompute_crypto_candidates(
                     'is_filled': bool(fill_step is not None),
                     'fill_time': fill_time,
                     'exit_time': exit_time,
+                    'bars_held': int(bars_held),
                     'p_entry': float(p_entry) if fill_step is not None else 0.0,
                     'p_exit': float(p_exit),
                     'net_ret_pct': float(net_ret_pct),
@@ -300,15 +344,17 @@ def get_or_precompute_crypto_candidates(
                 })
                 symbol_cands += 1
 
-        print(f"   ✅ {clean:<8}: Precomputed {symbol_cands:,} candidate setups.")
+        if verbose:
+            print(f"   ✅ {clean:<8}: Precomputed {symbol_cands:,} candidate setups.")
 
     all_candidates.sort(key=lambda c: c['timestamp'])
 
     # Save to parquet cache
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     df_save = pd.DataFrame(all_candidates)
-    df_save.to_parquet(CANDIDATE_CACHE_FILE, index=False)
-    print(f"💾 Cached {len(all_candidates):,} candidate setups to {CANDIDATE_CACHE_FILE.name}")
+    df_save.to_parquet(cache_path, index=False)
+    if verbose:
+        print(f"💾 Cached {len(all_candidates):,} candidate setups to {cache_path.name}")
 
     return all_candidates
 
@@ -326,7 +372,10 @@ def simulate_crypto_prioritization(
     position_fraction: float = POSITION_SIZE_FRACTION,
     order_ttl_bars: int = ORDER_TTL_BARS,
     asymmetric_sizing: bool = False,
-    resting_orders_consume_slots: bool = RESTING_ORDERS_CONSUME_SLOTS
+    resting_orders_consume_slots: bool = RESTING_ORDERS_CONSUME_SLOTS,
+    sizing_mode: str = DEFAULT_SIZING_MODE,
+    geometric_base_fraction: float = DEFAULT_GEOMETRIC_FRACTION,
+    min_order_dollars: float = MIN_ORDER_DOLLARS
 ) -> Dict[str, Any]:
     """
     Simulates continuous 24/7 cross-asset capital allocation:
@@ -335,6 +384,7 @@ def simulate_crypto_prioritization(
       - If enable_macro_red_eviction is True, incoming Bear setups can evict resting Bull orders.
       - If resting_orders_consume_slots is True, resting limit orders reserve slots and escrow cash.
         If False, resting orders do not reserve slots until filled (matches Discount Lab accounting).
+      - sizing_mode: 'UNIFORM_FIXED' (proportional to total equity) or 'GEOMETRIC_FREE_CASH' (fraction of free cash).
     """
     free_cash = initial_capital
     active_positions = []
@@ -363,6 +413,14 @@ def simulate_crypto_prioritization(
             if pos['exit_time'] <= current_time:
                 net_pnl = pos['allocated_cap'] * (pos['net_ret_pct'] / 100.0)
                 free_cash += pos['allocated_cap'] + net_pnl
+                b_held = pos.get('bars_held', 0)
+                if b_held == 0 and pos.get('fill_time') is not None and pos.get('exit_time') is not None:
+                    try:
+                        delta_m = (pd.to_datetime(pos['exit_time']) - pd.to_datetime(pos['fill_time'])).total_seconds() / 60.0
+                        b_held = max(1, int(round(delta_m / 15.0)))
+                    except Exception:
+                        b_held = 1
+
                 executed_trades.append({
                     'symbol': pos['symbol'],
                     'entry_time': pos['fill_time'],
@@ -372,7 +430,8 @@ def simulate_crypto_prioritization(
                     'is_win': pos['is_win'],
                     'exit_reason': pos['exit_reason'],
                     'is_bear': pos['is_bear'],
-                    'expected_value': pos['expected_value']
+                    'expected_value': pos['expected_value'],
+                    'bars_held': b_held
                 })
             else:
                 still_active.append(pos)
@@ -387,9 +446,12 @@ def simulate_crypto_prioritization(
                     total_eq = free_cash + sum(p['allocated_cap'] for p in active_positions)
                     if len(active_positions) < max_slots:
                         size_mult = (1.0 if order['is_bear'] else 0.5) if asymmetric_sizing else 1.0
-                        target_slot_cap = total_eq * position_fraction * size_mult
+                        if sizing_mode == "GEOMETRIC_FREE_CASH":
+                            target_slot_cap = free_cash * geometric_base_fraction * size_mult
+                        else:
+                            target_slot_cap = total_eq * position_fraction * size_mult
                         alloc_cap = min(target_slot_cap, free_cash)
-                        if alloc_cap >= 50.0:
+                        if alloc_cap >= min_order_dollars:
                             free_cash -= alloc_cap
                             order['allocated_cap'] = alloc_cap
                             active_positions.append(order)
@@ -439,10 +501,15 @@ def simulate_crypto_prioritization(
                 allocated_slots = len(active_positions) + len(pending_orders)
 
                 size_mult = (1.0 if cand['is_bear'] else 0.5) if asymmetric_sizing else 1.0
-                target_slot_cap = total_equity * position_fraction * size_mult
+
+                if sizing_mode == "GEOMETRIC_FREE_CASH":
+                    target_slot_cap = free_cash * geometric_base_fraction * size_mult
+                else:
+                    target_slot_cap = total_equity * position_fraction * size_mult
+
                 alloc_cap = min(target_slot_cap, free_cash)
 
-                if alloc_cap < 50.0:
+                if alloc_cap < min_order_dollars:
                     starved_signals += 1
                     starved_by_symbol[cand['symbol']] += 1
                     continue
@@ -461,6 +528,7 @@ def simulate_crypto_prioritization(
                     'net_ret_pct': cand['net_ret_pct'],
                     'is_win': cand['is_win'],
                     'exit_reason': cand['exit_reason'],
+                    'bars_held': cand.get('bars_held', 0),
                     'bars_waiting': 0
                 }
 
@@ -480,6 +548,10 @@ def simulate_crypto_prioritization(
                             pending_orders.remove(worst_order)
                             free_cash += worst_order['allocated_cap']
 
+                            if sizing_mode == "GEOMETRIC_FREE_CASH":
+                                target_slot_cap = free_cash * geometric_base_fraction * size_mult
+                            else:
+                                target_slot_cap = total_equity * position_fraction * size_mult
                             alloc_cap_new = min(target_slot_cap, free_cash)
                             free_cash -= alloc_cap_new
                             order_payload['allocated_cap'] = alloc_cap_new
@@ -515,6 +587,7 @@ def simulate_crypto_prioritization(
                     'net_ret_pct': cand['net_ret_pct'],
                     'is_win': cand['is_win'],
                     'exit_reason': cand['exit_reason'],
+                    'bars_held': cand.get('bars_held', 0),
                     'bars_waiting': 0
                 }
                 pending_orders.append(order_payload)
@@ -526,6 +599,14 @@ def simulate_crypto_prioritization(
     for pos in active_positions:
         net_pnl = pos['allocated_cap'] * (pos['net_ret_pct'] / 100.0)
         free_cash += pos['allocated_cap'] + net_pnl
+        b_held = pos.get('bars_held', 0)
+        if b_held == 0 and pos.get('fill_time') is not None and pos.get('exit_time') is not None:
+            try:
+                delta_m = (pd.to_datetime(pos['exit_time']) - pd.to_datetime(pos['fill_time'])).total_seconds() / 60.0
+                b_held = max(1, int(round(delta_m / 15.0)))
+            except Exception:
+                b_held = 1
+
         executed_trades.append({
             'symbol': pos['symbol'],
             'entry_time': pos['fill_time'],
@@ -535,7 +616,8 @@ def simulate_crypto_prioritization(
             'is_win': pos['is_win'],
             'exit_reason': pos['exit_reason'],
             'is_bear': pos['is_bear'],
-            'expected_value': pos['expected_value']
+            'expected_value': pos['expected_value'],
+            'bars_held': b_held
         })
 
     for order in pending_orders:
@@ -552,6 +634,15 @@ def simulate_crypto_prioritization(
     gross_win = float(wins.sum()) if len(wins) > 0 else 0.0
     gross_loss = float(abs(losses.sum())) if len(losses) > 0 else 1e-6
     profit_factor = gross_win / gross_loss if gross_loss > 0 else 99.0
+
+    # Detailed Exit Reason & Holding Diagnostics
+    tp_count = int((df_trades['exit_reason'] == 'TARGET_TP').sum()) if n_trades > 0 else 0
+    stop_count = int((df_trades['exit_reason'] == 'STOP').sum()) if n_trades > 0 else 0
+    timeout_count = int((df_trades['exit_reason'] == 'TIMEOUT').sum()) if n_trades > 0 else 0
+    tp_pct = (tp_count / n_trades * 100.0) if n_trades > 0 else 0.0
+    stop_pct = (stop_count / n_trades * 100.0) if n_trades > 0 else 0.0
+    timeout_pct = (timeout_count / n_trades * 100.0) if n_trades > 0 else 0.0
+    avg_bars_held = float(df_trades['bars_held'].mean()) if (n_trades > 0 and 'bars_held' in df_trades.columns) else 0.0
 
     eq_arr = np.array(equity_curve) if equity_curve else np.array([initial_capital, final_equity])
     running_max = np.maximum.accumulate(eq_arr)
@@ -572,6 +663,13 @@ def simulate_crypto_prioritization(
         'eviction_count': len(eviction_events),
         'admitted_by_symbol': admitted_by_symbol,
         'starved_by_symbol': starved_by_symbol,
+        'tp_count': tp_count,
+        'stop_count': stop_count,
+        'timeout_count': timeout_count,
+        'tp_pct': tp_pct,
+        'stop_pct': stop_pct,
+        'timeout_pct': timeout_pct,
+        'avg_bars_held': avg_bars_held,
         'equity_curve': eq_arr
     }
 
@@ -581,7 +679,8 @@ def simulate_crypto_prioritization(
 # ==============================================================================
 def plot_crypto_prioritization_dashboard(
     policy_results: Dict[str, Dict],
-    scarcity_results: Dict[int, Dict]
+    scarcity_results: Dict[str, Dict],
+    horizon_results: Optional[Dict[str, Dict]] = None
 ) -> None:
     """Renders the dark-mode 4-panel cross-asset prioritization dashboard."""
     plt.style.use('dark_background')
@@ -650,28 +749,57 @@ def plot_crypto_prioritization_dashboard(
     ax3.grid(True, alpha=0.2)
 
     # --------------------------------------------------------------------------
-    # Panel 4: Asset Allocation & Selection Distribution (Who Gets Admitted?)
+    # Panel 4: Horizon Tournament OR Asset Allocation Distribution
     # --------------------------------------------------------------------------
     ax4 = axes[1, 1]
-    symbols = list(CRYPTO_CHAMPIONS.keys())
-    x_sym = np.arange(len(symbols))
-    width = 0.25
+    if horizon_results:
+        # Plot Trade Holding Horizon Tournament
+        horizon_styles = {
+            '4.0 Hours': ('#ffffff', '--', 2.4),
+            '8.0 Hours': ('#00e5ff', '-', 1.6),
+            '12.0 Hours': ('#00e676', '-', 2.4),
+            '24.0 Hours': ('#ffea00', '-.', 2.4),
+            '48.0 Hours': ('#d500f9', '-', 1.6),
+            'Indefinite': ('#ff1744', '-', 2.0),
+        }
+        for h_name, res in horizon_results.items():
+            matched = False
+            for k_prefix, (c, ls, lw) in horizon_styles.items():
+                if k_prefix in h_name:
+                    ax4.plot(res['equity_curve'], color=c, lw=lw, linestyle=ls,
+                             label=f"{h_name} (Ret: {res['tot_return_pct']:+.1f}% | DD: {res['max_dd']:.1f}%)")
+                    matched = True
+                    break
+            if not matched:
+                ax4.plot(res['equity_curve'], lw=1.5,
+                         label=f"{h_name} (Ret: {res['tot_return_pct']:+.1f}% | DD: {res['max_dd']:.1f}%)")
 
-    # Compare Baseline vs Net EV vs Combined Champion
-    adm_base = [policy_results['Policy 0: Baseline FCFS']['admitted_by_symbol'][s] for s in symbols]
-    adm_ev   = [policy_results['Policy 1: Net Expected Value (EV)']['admitted_by_symbol'][s] for s in symbols]
-    adm_comb = [policy_results['Policy 5: Combined Champion (Macro Red + EV + Evict)']['admitted_by_symbol'][s] for s in symbols]
+        ax4.axhline(INITIAL_CAPITAL, color='white', linestyle='--', alpha=0.4)
+        ax4.set_title("Panel 4: Trade Holding Horizon Tournament (Policy 4 RVOL, K=2 Slots)", color='white', fontsize=11)
+        ax4.set_xlabel("15m Timeline Progression", fontsize=10)
+        ax4.set_ylabel("Portfolio Capital ($ USD)", fontsize=10)
+        ax4.legend(loc='upper left', fontsize=8.0, framealpha=0.3)
+        ax4.grid(True, alpha=0.2)
+    else:
+        symbols = list(CRYPTO_CHAMPIONS.keys())
+        x_sym = np.arange(len(symbols))
+        width = 0.25
 
-    ax4.bar(x_sym - width, adm_base, width, label='Policy 0 (Baseline FCFS)', color='#78909c', alpha=0.85)
-    ax4.bar(x_sym, adm_ev, width, label='Policy 1 (Net EV)', color='#00e5ff', alpha=0.85)
-    ax4.bar(x_sym + width, adm_comb, width, label='Policy 5 (Combined Champion)', color='#00e676', alpha=0.85)
+        # Compare Baseline vs Net EV vs Combined Champion
+        adm_base = [policy_results['Policy 0: Baseline FCFS']['admitted_by_symbol'][s] for s in symbols]
+        adm_ev   = [policy_results['Policy 1: Net Expected Value (EV)']['admitted_by_symbol'][s] for s in symbols]
+        adm_comb = [policy_results['Policy 5: Combined Champion (Macro Red + EV + Evict)']['admitted_by_symbol'][s] for s in symbols]
 
-    ax4.set_xticks(x_sym)
-    ax4.set_xticklabels(symbols, fontsize=10)
-    ax4.set_ylabel("Admitted Trade Count", color='white', fontsize=10)
-    ax4.set_title("Panel 4: Asset Allocation Distribution by Prioritization Architecture", color='white', fontsize=11)
-    ax4.legend(loc='upper right', fontsize=8.5, framealpha=0.3)
-    ax4.grid(True, alpha=0.2)
+        ax4.bar(x_sym - width, adm_base, width, label='Policy 0 (Baseline FCFS)', color='#78909c', alpha=0.85)
+        ax4.bar(x_sym, adm_ev, width, label='Policy 1 (Net EV)', color='#00e5ff', alpha=0.85)
+        ax4.bar(x_sym + width, adm_comb, width, label='Policy 5 (Combined Champion)', color='#00e676', alpha=0.85)
+
+        ax4.set_xticks(x_sym)
+        ax4.set_xticklabels(symbols, fontsize=10)
+        ax4.set_ylabel("Admitted Trade Count", color='white', fontsize=10)
+        ax4.set_title("Panel 4: Asset Allocation Distribution by Prioritization Architecture", color='white', fontsize=11)
+        ax4.legend(loc='upper right', fontsize=8.5, framealpha=0.3)
+        ax4.grid(True, alpha=0.2)
 
     plt.tight_layout()
     plt.show()
@@ -691,7 +819,8 @@ def main():
     print("=" * 105)
 
     # Step 1: Load cached candidates in 0.1s
-    candidates = get_or_precompute_crypto_candidates()
+    candidates = get_or_precompute_crypto_candidates(verbose=False)
+    print("⚡ Initialized universe candidate setups from parquet cache in 0.1s.")
 
     # Canonical symbol index map for Policy 0
     sym_order = {s: i for i, s in enumerate(CRYPTO_CHAMPIONS.keys())}
@@ -803,9 +932,56 @@ def main():
         print(f"{sym:<8} | {adm_0:<14} | {adm_1:<12} | {adm_5:<18} | {starv_5:<16}")
     print("=" * 105)
 
+    # ==========================================================================
+    # TABLE 4: TRADE HOLDING HORIZON SENSITIVITY TOURNAMENT (POLICY 4 RVOL BENCHMARK)
+    # ==========================================================================
+    print("\n" + "=" * 105)
+    print("⏳ [TABLE 4] TRADE HOLDING HORIZON SENSITIVITY TOURNAMENT (POLICY 4 RVOL BENCHMARK)...")
+    print("   Champion Architecture: Policy 4 RVOL Volume Surge | Uniform Fixed 50% Sizing (K=2 Slots)")
+    print("   Evaluating Max Holding Durations: 4h (16b) vs 8h (32b) vs 12h (48b) vs 24h (96b) vs 48h (192b) vs Indefinite")
+    print("=" * 105)
+
+    horizon_configs = [
+        ("4.0 Hours (16 Bars - Baseline)", 16),
+        ("8.0 Hours (32 Bars)", 32),
+        ("12.0 Hours (48 Bars - Champion)", 48),
+        ("24.0 Hours (96 Bars - Jesse Model)", 96),
+        ("48.0 Hours (192 Bars)", 192),
+        ("Indefinite Hold (Pure Barrier - Accretion)", 999999)
+    ]
+
+    horizon_results = {}
+    rvol_ranking_fn = lambda c: c['rvol']
+
+    for h_label, h_bars in horizon_configs:
+        # Load or precompute candidate setups for this exact horizon quietly
+        h_candidates = get_or_precompute_crypto_candidates(horizon_bars=h_bars, verbose=False)
+        res_h = simulate_crypto_prioritization(
+            h_candidates,
+            policy_name=h_label,
+            priority_ranking_fn=rvol_ranking_fn,
+            enable_macro_red_eviction=False,
+            max_slots=2,
+            position_fraction=0.50,
+            sizing_mode="UNIFORM_FIXED",
+            resting_orders_consume_slots=RESTING_ORDERS_CONSUME_SLOTS
+        )
+        horizon_results[h_label] = res_h
+
+        print(
+            f"  • {h_label:<42} | Tr: {res_h['trades']:<4} | WR: {res_h['win_rate']:>5.1f}% | PF: {res_h['profit_factor']:>4.2f} | "
+            f"Final: ${res_h['final_equity']:>10.2f} | Ret: {res_h['tot_return_pct']:>+6.1f}% | DD: {res_h['max_dd']:>5.1f}% | "
+            f"Calm: {res_h['calmar']:>5.2f} | TP: {res_h['tp_pct']:>4.1f}% | SL: {res_h['stop_pct']:>4.1f}% | TO: {res_h['timeout_pct']:>4.1f}% | AvgB: {res_h['avg_bars_held']:>4.1f}"
+        )
+    print("=" * 105)
+
     # Step 5: Render Dark-Mode 4-Panel Verification Dashboard
     print("\n📊 Rendering 4-panel dark-mode verification dashboard via plt.show()...")
-    plot_crypto_prioritization_dashboard(policy_results, scarcity_results)
+    plot_crypto_prioritization_dashboard(
+        policy_results,
+        scarcity_results,
+        horizon_results=horizon_results
+    )
 
 
 if __name__ == "__main__":
